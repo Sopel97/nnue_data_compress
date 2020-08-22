@@ -6,6 +6,8 @@ For example usage see "--help".
 
 
 # Building
+Requires a compiler with support for C++17.
+
 `make release`
 
 # Further plans
