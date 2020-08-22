@@ -145,6 +145,8 @@ std::size_t usedBitsSafe(std::size_t value)
     return util::usedBits(value - 1);
 }
 
+static constexpr std::size_t scoreVleBlockSize = 4;
+
 struct PackedMoveScoreListReader
 {
     PlainEntry entry;
@@ -339,7 +341,7 @@ struct PackedMoveScoreListReader
         }
         }
 
-        score = m_lastScore + unsignedToSigned(extractVle16(4));
+        score = m_lastScore + unsignedToSigned(extractVle16(scoreVleBlockSize));
         m_lastScore = -score;
 
         return {move, score};
@@ -400,7 +402,7 @@ struct PackedMoveScoreList
         {
             std::uint8_t block = (v & mask) | ((v > mask) << blockSize);
             addBitsLE8(block, blockSize + 1);
-            v >>= 4;
+            v >>= blockSize;
             if (v == 0) break;
         }
     }
@@ -514,7 +516,7 @@ struct PackedMoveScoreList
         addBitsLE8(moveId, usedBitsSafe(numMoves));
 
         std::uint16_t scoreDelta = signedToUnsigned(score - m_lastScore);
-        addBitsVle16(scoreDelta, 4);
+        addBitsVle16(scoreDelta, scoreVleBlockSize);
         m_lastScore = -score;
 
         ++numPlies;
