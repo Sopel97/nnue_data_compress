@@ -1,0 +1,879 @@
+/*
+  Copyright (C) 2018  Francesc Alted
+  http://blosc.org
+  License: BSD 3-Clause (see LICENSE.txt)
+
+  Example program demonstrating frames going bigger than 2 GB.
+
+  To compile this program:
+
+  $ gcc -O frame_big.c -o frame_big -lblosc2
+
+  To run:
+
+  $ ./frame_big
+  Blosc version info: 2.0.0-beta.4.dev ($Date:: 2019-09-02 #$)
+  Compression ratio: 4577.6 MB -> 169.8 MB (27.0x)
+  Time for append data to a schunk backed by a fileframe: 2.61 s, 1750.8 MB/s
+  Successful roundtrip data <-> schunk (frame-backed) !
+
+ */
+
+#include <cstdio>
+#include <cassert>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <fstream>
+#include <cstring>
+#include <iostream>
+
+#include <blosc/blosc2.h>
+
+#include "chess/Position.h"
+#include "chess/Uci.h"
+
+constexpr std::size_t KiB = 1024;
+constexpr std::size_t MiB = (1024*KiB);
+constexpr std::size_t GiB = (1024*MiB);
+
+#define NTHREADS 4
+
+using namespace std::literals;
+
+namespace blosc2
+{
+    struct FrameDeleter
+    {
+        void operator()(blosc2_frame* frame) const
+        {
+            blosc2_free_frame(frame);
+        }
+    };
+
+    struct SuperChunkDeleter
+    {
+        void operator()(blosc2_schunk* schunk) const
+        {
+            blosc2_free_schunk(schunk);
+        }
+    };
+
+    struct ContextDeleter
+    {
+        void operator()(blosc2_context* ctx) const
+        {
+            blosc2_free_ctx(ctx);
+        }
+    };
+
+    using UniqueFramePtr = std::unique_ptr<blosc2_frame, FrameDeleter>;
+    using UniqueSuperChunkPtr = std::unique_ptr<blosc2_schunk, SuperChunkDeleter>;
+    using UniqueContextPtr = std::unique_ptr<blosc2_context, ContextDeleter>;
+
+    struct CompressedFile
+    {
+        CompressedFile(std::string path, std::size_t typesize) :
+            m_path(std::move(path)),
+            m_file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out | std::ios_base::app),
+            m_typesize(typesize)
+        {
+            blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
+            blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+            cparams.typesize = typesize;
+            for (int i = 0; i < BLOSC2_MAX_FILTERS; ++i)
+            {
+                cparams.filters[i] = BLOSC_NOSHUFFLE;
+            }
+            cparams.filters[0] = BLOSC_SHUFFLE;
+            cparams.compcode = BLOSC_ZSTD;
+            cparams.clevel = 5;
+            cparams.nthreads = NTHREADS;
+
+            dparams.nthreads = NTHREADS;
+
+            m_compressionContext = UniqueContextPtr(blosc2_create_cctx(cparams));
+            m_decompressionContext = UniqueContextPtr(blosc2_create_dctx(dparams));
+        }
+
+        void append(const char* data, std::size_t size)
+        {
+            std::vector<char> dest(size);
+            int compressedBytes = blosc2_compress_ctx(m_compressionContext.get(), size, data, dest.data(), dest.size());
+            if (compressedBytes < 0)
+            {
+                throw std::runtime_error("");
+            }
+            else if (compressedBytes == 0 || compressedBytes >= size)
+            {
+                writeChunkHeader(size, size);
+                m_file.write(data, size);
+            }
+            else
+            {
+                writeChunkHeader(size, compressedBytes);
+                m_file.write(dest.data(), compressedBytes);
+            }
+        }
+
+        bool hasNextChunk()
+        {
+            m_file.peek();
+            return !m_file.eof();
+        }
+
+        std::vector<unsigned char> readNextChunk()
+        {
+            auto [decompressedSize, compressedSize] = readChunkHeader();
+            std::vector<unsigned char> decompressed(decompressedSize);
+            if (decompressedSize == compressedSize)
+            {
+                m_file.read(reinterpret_cast<char*>(decompressed.data()), decompressedSize);
+                return decompressed;
+            }
+            else
+            {
+                std::vector<unsigned char> compressed(compressedSize);
+                m_file.read(reinterpret_cast<char*>(compressed.data()), compressedSize);
+                int decompressedBytes = blosc2_decompress_ctx(
+                    m_decompressionContext.get(),
+                    reinterpret_cast<const void*>(compressed.data()),
+                    compressedSize,
+                    reinterpret_cast<void*>(decompressed.data()),
+                    decompressedSize);
+                if (decompressedBytes <= 0)
+                {
+                    throw std::runtime_error("");
+                }
+                return decompressed;
+            }
+        }
+
+    private:
+        std::string m_path;
+        std::fstream m_file;
+        std::size_t m_typesize;
+        UniqueContextPtr m_compressionContext;
+        UniqueContextPtr m_decompressionContext;
+
+        void writeChunkHeader(unsigned decompressedSize, unsigned compressedSize)
+        {
+            unsigned char header[8];
+            header[0] = decompressedSize;
+            header[1] = decompressedSize >> 8;
+            header[2] = decompressedSize >> 16;
+            header[3] = decompressedSize >> 24;
+            header[4] = compressedSize;
+            header[5] = compressedSize >> 8;
+            header[6] = compressedSize >> 16;
+            header[7] = compressedSize >> 24;
+            m_file.write(reinterpret_cast<const char*>(header), 8);
+        }
+
+        std::pair<unsigned, unsigned> readChunkHeader()
+        {
+            unsigned char header[8];
+            m_file.read(reinterpret_cast<char*>(header), 8);
+            unsigned decompressedSize =
+                header[0]
+                | (header[1] << 8)
+                | (header[2] << 16)
+                | (header[3] << 24);
+            unsigned compressedSize =
+                header[4]
+                | (header[5] << 8)
+                | (header[6] << 16)
+                | (header[7] << 24);
+            return {decompressedSize, compressedSize};
+        }
+    };
+}
+
+void compressBin(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = 40;
+    constexpr std::size_t chunkSize = MiB / entrySize * entrySize;
+
+    std::vector<char> buffer(chunkSize);
+    blosc2::CompressedFile outputFile(outputPath, entrySize);
+    std::ifstream inputFile(inputPath, std::ios_base::binary);
+    for(;;)
+    {
+        inputFile.read(buffer.data(), chunkSize);
+        auto readBytes = inputFile.gcount();
+        if (readBytes <= 0)
+        {
+            break;
+        }
+        outputFile.append(buffer.data(), readBytes);
+    }
+}
+
+void decompressBin(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = 40;
+
+    blosc2::CompressedFile inputFile(inputPath, entrySize);
+    std::ofstream outputFile(outputPath, std::ios_base::binary);
+    while(inputFile.hasNextChunk())
+    {
+        auto data = inputFile.readNextChunk();
+        outputFile.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+}
+
+std::uint16_t signedToUnsigned(std::int16_t a)
+{
+    std::uint16_t r;
+    std::memcpy(&r, &a, sizeof(std::uint16_t));
+    if (r & 0x8000)
+    {
+        r ^= 0x7FFF;
+    }
+    r = (r << 1) | (r >> 15);
+    return r;
+}
+
+std::int16_t unsignedToSigned(std::uint16_t r)
+{
+    std::int16_t a;
+    r = (r << 15) | (r >> 1);
+    if (r & 0x8000)
+    {
+        r ^= 0x7FFF;
+    }
+    std::memcpy(&a, &r, sizeof(std::uint16_t));
+    return a;
+}
+
+struct PlainEntry
+{
+    Position pos;
+    Move move;
+    std::int16_t score;
+    std::uint16_t ply;
+    std::int16_t result;
+    std::uint16_t rule50Counter;
+};
+
+bool isContinuation(const PlainEntry& lhs, const PlainEntry& rhs)
+{
+    return
+        lhs.result == -rhs.result
+        && lhs.ply + 1 == rhs.ply
+        && lhs.pos.afterMove(lhs.move) == rhs.pos;
+}
+
+struct PackedEntry
+{
+    unsigned char bytes[32];
+};
+
+std::size_t usedBitsSafe(std::size_t value)
+{
+    if (value == 0) return 0;
+    return util::usedBits(value - 1);
+}
+
+struct PackedMoveScoreListReader
+{
+    PlainEntry entry;
+    std::uint16_t numPlies;
+    unsigned char* movetext;
+
+    PackedMoveScoreListReader(const PlainEntry& entry, unsigned char* movetext, std::uint16_t numPlies) :
+        entry(entry),
+        movetext(movetext),
+        numPlies(numPlies),
+        m_lastScore(-entry.score)
+    {
+
+    }
+
+    [[nodiscard]] std::uint8_t extractBitsLE8(std::size_t count)
+    {
+        if (count == 0) return 0;
+
+        if (m_readBitsLeft == 0)
+        {
+            m_readOffset += 1;
+            m_readBitsLeft = 8;
+        }
+
+        const std::uint8_t byte = movetext[m_readOffset] << (8 - m_readBitsLeft);
+        std::uint8_t bits = byte >> (8 - count);
+
+        if (count > m_readBitsLeft)
+        {
+            const auto spillCount = count - m_readBitsLeft;
+            bits |= movetext[m_readOffset + 1] >> (8 - spillCount);
+
+            m_readBitsLeft += 8;
+            m_readOffset += 1;
+        }
+
+        m_readBitsLeft -= count;
+
+        return bits;
+    }
+
+    std::uint16_t extractVle16(std::size_t blockSize)
+    {
+        auto mask = (1 << blockSize) - 1;
+        std::uint16_t v = 0;
+        std::size_t offset = 0;
+        for(;;)
+        {
+            std::uint16_t block = extractBitsLE8(blockSize + 1);
+            v |= ((block & mask) << offset);
+            if (!(block >> blockSize))
+            {
+                break;
+            }
+
+            offset += blockSize;
+        }
+        return v;
+    }
+
+    PlainEntry nextEntry()
+    {
+        entry.pos.doMove(entry.move);
+        auto [move, score] = nextMoveScore(entry.pos);
+        entry.move = move;
+        entry.score = score;
+        entry.ply += 1;
+        entry.result = -entry.result;
+        return entry;
+    }
+
+    std::pair<Move, std::int16_t> nextMoveScore(const Position& pos)
+    {
+        Move move;
+        std::int16_t score;
+
+        const Color sideToMove = pos.sideToMove();
+        const Bitboard ourPieces = pos.piecesBB(sideToMove);
+        const Bitboard theirPieces = pos.piecesBB(!sideToMove);
+        const Bitboard occupied = ourPieces | theirPieces;
+
+        const auto pieceId = extractBitsLE8(usedBitsSafe(ourPieces.count()));
+        const auto from = Square(nthSetBitIndex(ourPieces.bits(), pieceId));
+
+        const auto pt = pos.pieceAt(from).type();
+        switch (pt)
+        {
+        case PieceType::Pawn:
+        {
+            const Rank promotionRank = pos.sideToMove() == Color::White ? rank7 : rank2;
+            const Rank startRank = pos.sideToMove() == Color::White ? rank2 : rank7;
+            const auto forward = sideToMove == Color::White ? FlatSquareOffset(0, 1) : FlatSquareOffset(0, -1);
+
+            const Square epSquare = pos.epSquare();
+
+            Bitboard attackTargets = theirPieces;
+            if (epSquare != Square::none())
+            {
+                attackTargets |= epSquare;
+            }
+
+            Bitboard destinations = bb::pawnAttacks(Bitboard::square(from), sideToMove) & attackTargets;
+
+            const Square sqForward = from + forward;
+            if (!occupied.isSet(sqForward))
+            {
+                destinations |= sqForward;
+
+                const Square sqForward2 = sqForward + forward;
+                if (
+                    from.rank() == startRank
+                    && !occupied.isSet(sqForward2)
+                    )
+                {
+                    destinations |= sqForward2;
+                }
+            }
+
+            const auto destinationsCount = destinations.count();
+            if (from.rank() == promotionRank)
+            {
+                const auto moveId = extractBitsLE8(usedBitsSafe(destinationsCount * 4ull));
+                const Piece promotedPiece = Piece(
+                    fromOrdinal<PieceType>(ordinal(PieceType::Knight) + (moveId % 4ull)),
+                    sideToMove
+                );
+                const auto to = Square(nthSetBitIndex(destinations.bits(), moveId / 4ull));
+
+                move = Move::promotion(from, to, promotedPiece);
+                break;
+            }
+            else
+            {
+                auto moveId = extractBitsLE8(usedBitsSafe(destinationsCount));
+                const auto to = Square(nthSetBitIndex(destinations.bits(), moveId));
+                if (to == epSquare)
+                {
+                    move = Move::enPassant(from, to);
+                    break;
+                }
+                else
+                {
+                    move = Move::normal(from, to);
+                    break;
+                }
+            }
+        }
+        case PieceType::King:
+        {
+            const CastlingRights ourCastlingRightsMask =
+                sideToMove == Color::White
+                ? CastlingRights::White
+                : CastlingRights::Black;
+
+            const CastlingRights castlingRights = pos.castlingRights();
+
+            const Bitboard attacks = bb::pseudoAttacks<PieceType::King>(from) & ~ourPieces;
+            const std::size_t attacksSize = attacks.count();
+            const std::size_t numCastlings = intrin::popcount(ordinal(castlingRights & ourCastlingRightsMask));
+
+            const auto moveId = extractBitsLE8(usedBitsSafe(attacksSize + numCastlings));
+
+            if (moveId >= attacksSize)
+            {
+                const std::size_t idx = moveId - attacksSize;
+
+                const CastleType castleType =
+                    idx == 0
+                    && contains(castlingRights, CastlingTraits::castlingRights[sideToMove][CastleType::Long])
+                    ? CastleType::Long
+                    : CastleType::Short;
+
+                move = Move::castle(castleType, sideToMove);
+                break;
+            }
+            else
+            {
+                auto to = Square(nthSetBitIndex(attacks.bits(), moveId));
+                move = Move::normal(from, to);
+                break;
+            }
+            break;
+        }
+        default:
+        {
+            const Bitboard attacks = bb::attacks(pt, from, occupied) & ~ourPieces;
+            const auto moveId = extractBitsLE8(usedBitsSafe(attacks.count()));
+            auto to = Square(nthSetBitIndex(attacks.bits(), moveId));
+            move = Move::normal(from, to);
+            break;
+        }
+        }
+
+        score = m_lastScore + unsignedToSigned(extractVle16(4));
+        m_lastScore = -score;
+
+        return {move, score};
+    }
+
+    std::size_t numReadBytes()
+    {
+        return m_readOffset + 1;
+    }
+
+private:
+    std::size_t m_readBitsLeft = 8;
+    std::size_t m_readOffset = 0;
+    std::int16_t m_lastScore = 0;
+};
+
+struct PackedMoveScoreList
+{
+    std::uint16_t numPlies = 0;
+    std::vector<unsigned char> movetext;
+
+    void clear(const PlainEntry& e)
+    {
+        numPlies = 0;
+        movetext.clear();
+        m_bitsLeft = 0;
+        m_lastScore = -e.score;
+    }
+
+    void addBitsLE8(std::uint8_t bits, std::size_t count)
+    {
+        if (count == 0) return;
+
+        if (m_bitsLeft == 0)
+        {
+            movetext.emplace_back(bits << (8 - count));
+            m_bitsLeft = 8;
+        }
+        else if (count <= m_bitsLeft)
+        {
+            movetext.back() |= bits << (m_bitsLeft - count);
+        }
+        else
+        {
+            const auto spillCount = count - m_bitsLeft;
+            movetext.back() |= bits >> spillCount;
+            movetext.emplace_back(bits << (8 - spillCount));
+            m_bitsLeft += 8;
+        }
+
+        m_bitsLeft -= count;
+    }
+
+    void addBitsVle16(std::uint16_t v, std::size_t blockSize)
+    {
+        auto mask = (1 << blockSize) - 1;
+        for(;;)
+        {
+            std::uint8_t block = (v & mask) | ((v > mask) << blockSize);
+            addBitsLE8(block, blockSize + 1);
+            v >>= 4;
+            if (v == 0) break;
+        }
+    }
+
+
+    void addMoveScore(const Position& pos, Move move, std::int16_t score)
+    {
+        const Color sideToMove = pos.sideToMove();
+        const Bitboard ourPieces = pos.piecesBB(sideToMove);
+        const Bitboard theirPieces = pos.piecesBB(!sideToMove);
+        const Bitboard occupied = ourPieces | theirPieces;
+
+        const std::uint8_t pieceId = (pos.piecesBB(sideToMove) & bb::before(move.from)).count();
+        std::size_t numMoves = 0;
+        int moveId = 0;
+        const auto pt = pos.pieceAt(move.from).type();
+        switch (pt)
+        {
+        case PieceType::Pawn:
+        {
+            const Rank secondToLastRank = pos.sideToMove() == Color::White ? rank7 : rank2;
+            const Rank startRank = pos.sideToMove() == Color::White ? rank2 : rank7;
+            const auto forward = sideToMove == Color::White ? FlatSquareOffset(0, 1) : FlatSquareOffset(0, -1);
+
+            const Square epSquare = pos.epSquare();
+
+            Bitboard attackTargets = theirPieces;
+            if (epSquare != Square::none())
+            {
+                attackTargets |= epSquare;
+            }
+
+            Bitboard destinations = bb::pawnAttacks(Bitboard::square(move.from), sideToMove) & attackTargets;
+
+            const Square sqForward = move.from + forward;
+            if (!occupied.isSet(sqForward))
+            {
+                destinations |= sqForward;
+
+                const Square sqForward2 = sqForward + forward;
+                if (
+                    move.from.rank() == startRank
+                    && !occupied.isSet(sqForward2)
+                    )
+                {
+                    destinations |= sqForward2;
+                }
+            }
+
+            moveId = (destinations & bb::before(move.to)).count();
+            numMoves = destinations.count();
+            if (move.from.rank() == secondToLastRank)
+            {
+                const auto promotionIndex = (ordinal(move.promotedPiece.type()) - ordinal(PieceType::Knight));
+                moveId = moveId * 4 + promotionIndex;
+                numMoves *= 4;
+            }
+
+            break;
+        }
+        case PieceType::King:
+        {
+            const CastlingRights ourCastlingRightsMask =
+                sideToMove == Color::White
+                ? CastlingRights::White
+                : CastlingRights::Black;
+
+            const CastlingRights castlingRights = pos.castlingRights();
+
+            const Bitboard attacks = bb::pseudoAttacks<PieceType::King>(move.from) & ~ourPieces;
+            const auto attacksSize = attacks.count();
+            const auto numCastlingRights = intrin::popcount(ordinal(castlingRights & ourCastlingRightsMask));
+
+            numMoves += attacksSize;
+            numMoves += numCastlingRights;
+
+            if (move.type == MoveType::Castle)
+            {
+                const auto longCastlingRights = CastlingTraits::castlingRights[sideToMove][CastleType::Long];
+
+                moveId = attacksSize - 1;
+
+                if (contains(castlingRights, longCastlingRights))
+                {
+                    // We have to add one no matter if it's the used one or not.
+                    moveId += 1;
+                }
+
+                if (CastlingTraits::moveCastlingType(move) == CastleType::Short)
+                {
+                    moveId += 1;
+                }
+            }
+            else
+            {
+                moveId = (attacks & bb::before(move.to)).count();
+            }
+            break;
+        }
+        default:
+        {
+            const Bitboard attacks = bb::attacks(pt, move.from, occupied) & ~ourPieces;
+
+            moveId = (attacks & bb::before(move.to)).count();
+            numMoves = attacks.count();
+        }
+        }
+
+        const std::size_t numPieces = ourPieces.count();
+        addBitsLE8(pieceId, usedBitsSafe(numPieces));
+        addBitsLE8(moveId, usedBitsSafe(numMoves));
+
+        std::uint16_t scoreDelta = signedToUnsigned(score - m_lastScore);
+        addBitsVle16(scoreDelta, 4);
+        m_lastScore = -score;
+
+        ++numPlies;
+    }
+
+private:
+    std::size_t m_bitsLeft = 0;
+    std::int16_t m_lastScore = 0;
+};
+
+
+PackedEntry packEntry(const PlainEntry& plain)
+{
+    PackedEntry packed;
+
+    auto compressedPos = plain.pos.compress();
+    auto compressedMove = plain.move.compress();
+
+    static_assert(sizeof(compressedPos) + sizeof(compressedMove) + 6 == sizeof(PackedEntry));
+
+    std::size_t offset = 0;
+    compressedPos.writeToBigEndian(packed.bytes);
+    offset += sizeof(compressedPos);
+    compressedMove.writeToBigEndian(packed.bytes + offset);
+    offset += sizeof(compressedMove);
+    std::uint16_t pr = plain.ply | (signedToUnsigned(plain.result) << 14);
+    packed.bytes[offset++] = signedToUnsigned(plain.score) >> 8;
+    packed.bytes[offset++] = signedToUnsigned(plain.score);
+    packed.bytes[offset++] = pr >> 8;
+    packed.bytes[offset++] = pr;
+    packed.bytes[offset++] = plain.rule50Counter >> 8;
+    packed.bytes[offset++] = plain.rule50Counter;
+
+    return packed;
+}
+
+PlainEntry unpackEntry(const PackedEntry& packed)
+{
+    PlainEntry plain;
+
+    std::size_t offset = 0;
+    auto compressedPos = CompressedPosition::readFromBigEndian(packed.bytes);
+    plain.pos = compressedPos.decompress();
+    offset += sizeof(compressedPos);
+    auto compressedMove = CompressedMove::readFromBigEndian(packed.bytes + offset);
+    plain.move = compressedMove.decompress();
+    offset += sizeof(compressedMove);
+    plain.score = unsignedToSigned((packed.bytes[offset] << 8) | packed.bytes[offset+1]);
+    offset += 2;
+    std::uint16_t pr = (packed.bytes[offset] << 8) | packed.bytes[offset+1];
+    plain.ply = pr & 0x3FFF;
+    plain.result = unsignedToSigned(pr >> 14);
+    offset += 2;
+    plain.rule50Counter = (packed.bytes[offset] << 8) | packed.bytes[offset+1];
+    plain.pos.setRule50Counter(plain.rule50Counter);
+    plain.pos.setPly(plain.ply);
+
+    return plain;
+}
+
+constexpr std::size_t plainShuffleRange = 1;
+
+void compressPlain(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = sizeof(PackedEntry);
+    constexpr std::size_t chunkSize = MiB / entrySize * entrySize;
+
+    PlainEntry e;
+
+    std::string key;
+    std::string value;
+    std::string move;
+
+    std::ifstream inputFile(inputPath);
+    blosc2::CompressedFile outputFile(outputPath, plainShuffleRange);
+
+    std::vector<char> packedEntries(chunkSize * 2);
+    std::size_t packedSize = 0;
+
+    PlainEntry lastEntry{};
+    lastEntry.ply = 0xFFFF; // so it's never a continuation
+    lastEntry.result = 0x7FFF;
+
+    PackedMoveScoreList movelist{};
+
+    auto writeMovelist = [&](){
+        packedEntries[packedSize++] = movelist.numPlies >> 8;
+        packedEntries[packedSize++] = movelist.numPlies;
+        if (movelist.numPlies > 0)
+        {
+            std::memcpy(packedEntries.data() + packedSize, movelist.movetext.data(), movelist.movetext.size());
+            packedSize += movelist.movetext.size();
+        }
+    };
+
+    bool anyEntry = false;
+
+    for(;;)
+    {
+        inputFile >> key;
+        if (!inputFile)
+        {
+            break;
+        }
+
+        if (key == "e"sv)
+        {
+            e.move = uci::uciToMove(e.pos, move);
+            e.rule50Counter = e.pos.rule50Counter();
+
+            bool isCont = isContinuation(lastEntry, e);
+            if (isCont)
+            {
+                // add to movelist
+                movelist.addMoveScore(e.pos, e.move, e.score);
+            }
+            else
+            {
+                if (anyEntry)
+                {
+                    writeMovelist();
+                }
+
+                if (packedSize >= chunkSize)
+                {
+                    outputFile.append(packedEntries.data(), packedSize);
+
+                    packedEntries.clear();
+                    packedSize = 0;
+                }
+
+                auto packed = packEntry(e);
+                std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedEntry));
+                packedSize += sizeof(PackedEntry);
+
+                movelist.clear(e);
+
+                anyEntry = true;
+            }
+
+            lastEntry = e;
+
+            continue;
+        }
+
+        inputFile >> std::ws;
+        std::getline(inputFile, value, '\n');
+
+        if (key == "fen"sv) e.pos = Position::fromFen(value.c_str());
+        if (key == "move"sv) move = value;
+        if (key == "score"sv) e.score = std::stoi(value);
+        if (key == "ply"sv) e.ply = std::stoi(value);
+        if (key == "result"sv) e.result = std::stoi(value);
+    }
+
+    if (packedSize > 0)
+    {
+        writeMovelist();
+
+        outputFile.append(packedEntries.data(), packedSize);
+    }
+}
+
+void decompressPlain(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = sizeof(PackedEntry);
+
+    blosc2::CompressedFile inputFile(inputPath, plainShuffleRange);
+    std::ofstream outputFile(outputPath);
+
+    auto printEntry = [&](const PlainEntry& plain)
+    {
+        outputFile << "fen " << plain.pos.fen() << '\n';
+        outputFile << "move " << uci::moveToUci(plain.pos, plain.move) << '\n';
+        outputFile << "score " << plain.score << '\n';
+        outputFile << "ply " << plain.ply << '\n';
+        outputFile << "result " << plain.result << "\ne\n";
+    };
+
+    while(inputFile.hasNextChunk())
+    {
+        auto data = inputFile.readNextChunk();
+
+        for(std::size_t offset = 0; offset < data.size();)
+        {
+            PackedEntry packed;
+            std::memcpy(&packed, data.data() + offset, sizeof(PackedEntry));
+            offset += sizeof(PackedEntry);
+            std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
+            offset += 2;
+
+            auto plain = unpackEntry(packed);
+            printEntry(plain);
+
+            PackedMoveScoreListReader movelist(plain, reinterpret_cast<unsigned char*>(data.data()) + offset, numPlies);
+            for(int i = 0; i < numPlies; ++i)
+            {
+                auto entry = movelist.nextEntry();
+                printEntry(entry);
+            }
+
+            offset += movelist.numReadBytes();
+        }
+    }
+}
+
+int main()
+{
+    /*
+    compressBin("data.bin", "data.bin.blosc2");
+    decompressBin("data.bin.blosc2", "data_d.bin");
+
+    compressPlain("data.plain", "data.plain.blosc2");
+    decompressPlain("data.plain.blosc2", "data_d.plain");
+
+    compressPlain("data_d.plain", "data_d.plain.blosc2");
+    decompressPlain("data_d.plain.blosc2", "data_d2.plain");
+*/
+
+    compressPlain("data.plain", "data_d_delta.plain.blosc2");
+    decompressPlain("data_d_delta.plain.blosc2", "data_d2_delta.plain");
+
+    // TODO: store metadata, guard agains wrong usage
+    // TODO: allow specifying compression level
+    // TODO: CLI
+    // TODO: convert from bin to packed maybe?
+    // TODO: maybe optimize a bit
+    // TODO: cleanup
+
+  return 0;
+}

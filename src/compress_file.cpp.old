@@ -1,0 +1,414 @@
+/*
+  Copyright (C) 2018  Francesc Alted
+  http://blosc.org
+  License: BSD 3-Clause (see LICENSE.txt)
+
+  Example program demonstrating frames going bigger than 2 GB.
+
+  To compile this program:
+
+  $ gcc -O frame_big.c -o frame_big -lblosc2
+
+  To run:
+
+  $ ./frame_big
+  Blosc version info: 2.0.0-beta.4.dev ($Date:: 2019-09-02 #$)
+  Compression ratio: 4577.6 MB -> 169.8 MB (27.0x)
+  Time for append data to a schunk backed by a fileframe: 2.61 s, 1750.8 MB/s
+  Successful roundtrip data <-> schunk (frame-backed) !
+
+ */
+
+#include <cstdio>
+#include <cassert>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <fstream>
+#include <cstring>
+#include <iostream>
+
+#include <blosc/blosc2.h>
+
+#include "chess/Position.h"
+#include "chess/Uci.h"
+
+constexpr std::size_t KiB = 1024;
+constexpr std::size_t MiB = (1024*KiB);
+constexpr std::size_t GiB = (1024*MiB);
+
+#define NTHREADS 4
+
+using namespace std::literals;
+
+namespace blosc2
+{
+    struct FrameDeleter
+    {
+        void operator()(blosc2_frame* frame) const
+        {
+            blosc2_free_frame(frame);
+        }
+    };
+
+    struct SuperChunkDeleter
+    {
+        void operator()(blosc2_schunk* schunk) const
+        {
+            blosc2_free_schunk(schunk);
+        }
+    };
+
+    struct ContextDeleter
+    {
+        void operator()(blosc2_context* ctx) const
+        {
+            blosc2_free_ctx(ctx);
+        }
+    };
+
+    using UniqueFramePtr = std::unique_ptr<blosc2_frame, FrameDeleter>;
+    using UniqueSuperChunkPtr = std::unique_ptr<blosc2_schunk, SuperChunkDeleter>;
+    using UniqueContextPtr = std::unique_ptr<blosc2_context, ContextDeleter>;
+
+    struct CompressedFile
+    {
+        CompressedFile(std::string path, std::size_t typesize) :
+            m_path(std::move(path)),
+            m_file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out | std::ios_base::app),
+            m_typesize(typesize)
+        {
+            blosc2_cparams cparams = BLOSC2_CPARAMS_DEFAULTS;
+            blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+            cparams.typesize = typesize;
+            for (int i = 0; i < BLOSC2_MAX_FILTERS; ++i)
+            {
+                cparams.filters[i] = BLOSC_NOSHUFFLE;
+            }
+            cparams.filters[0] = BLOSC_SHUFFLE;
+            cparams.compcode = BLOSC_ZSTD;
+            cparams.clevel = 9;
+            cparams.nthreads = NTHREADS;
+
+            dparams.nthreads = NTHREADS;
+
+            m_compressionContext = UniqueContextPtr(blosc2_create_cctx(cparams));
+            m_decompressionContext = UniqueContextPtr(blosc2_create_dctx(dparams));
+        }
+
+        void append(const char* data, std::size_t size)
+        {
+            std::vector<char> dest(size);
+            int compressedBytes = blosc2_compress_ctx(m_compressionContext.get(), size, data, dest.data(), dest.size());
+            if (compressedBytes < 0)
+            {
+                throw std::runtime_error("");
+            }
+            else if (compressedBytes == 0 || compressedBytes >= size)
+            {
+                writeChunkHeader(size, size);
+                m_file.write(data, size);
+            }
+            else
+            {
+                writeChunkHeader(size, compressedBytes);
+                m_file.write(dest.data(), compressedBytes);
+            }
+        }
+
+        bool hasNextChunk()
+        {
+            m_file.peek();
+            return !m_file.eof();
+        }
+
+        std::vector<char> readNextChunk()
+        {
+            auto [decompressedSize, compressedSize] = readChunkHeader();
+            std::vector<char> decompressed(decompressedSize);
+            if (decompressedSize == compressedSize)
+            {
+                m_file.read(decompressed.data(), decompressedSize);
+                return decompressed;
+            }
+            else
+            {
+                std::vector<char> compressed(compressedSize);
+                m_file.read(compressed.data(), compressedSize);
+                int decompressedBytes = blosc2_decompress_ctx(
+                    m_decompressionContext.get(),
+                    reinterpret_cast<const void*>(compressed.data()),
+                    compressedSize,
+                    reinterpret_cast<void*>(decompressed.data()),
+                    decompressedSize);
+                if (decompressedBytes <= 0)
+                {
+                    throw std::runtime_error("");
+                }
+                return decompressed;
+            }
+        }
+
+    private:
+        std::string m_path;
+        std::fstream m_file;
+        std::size_t m_typesize;
+        UniqueContextPtr m_compressionContext;
+        UniqueContextPtr m_decompressionContext;
+
+        void writeChunkHeader(unsigned decompressedSize, unsigned compressedSize)
+        {
+            unsigned char header[8];
+            header[0] = decompressedSize;
+            header[1] = decompressedSize >> 8;
+            header[2] = decompressedSize >> 16;
+            header[3] = decompressedSize >> 24;
+            header[4] = compressedSize;
+            header[5] = compressedSize >> 8;
+            header[6] = compressedSize >> 16;
+            header[7] = compressedSize >> 24;
+            m_file.write(reinterpret_cast<const char*>(header), 8);
+        }
+
+        std::pair<unsigned, unsigned> readChunkHeader()
+        {
+            unsigned char header[8];
+            m_file.read(reinterpret_cast<char*>(header), 8);
+            unsigned decompressedSize =
+                header[0]
+                | (header[1] << 8)
+                | (header[2] << 16)
+                | (header[3] << 24);
+            unsigned compressedSize =
+                header[4]
+                | (header[5] << 8)
+                | (header[6] << 16)
+                | (header[7] << 24);
+            return {decompressedSize, compressedSize};
+        }
+    };
+}
+
+void compressBin(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = 40;
+    constexpr std::size_t chunkSize = MiB / entrySize * entrySize;
+
+    std::vector<char> buffer(chunkSize);
+    blosc2::CompressedFile outputFile(outputPath, entrySize);
+    std::ifstream inputFile(inputPath, std::ios_base::binary);
+    for(;;)
+    {
+        inputFile.read(buffer.data(), chunkSize);
+        auto readBytes = inputFile.gcount();
+        if (readBytes <= 0)
+        {
+            break;
+        }
+        outputFile.append(buffer.data(), readBytes);
+    }
+}
+
+void decompressBin(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = 40;
+
+    blosc2::CompressedFile inputFile(inputPath, entrySize);
+    std::ofstream outputFile(outputPath, std::ios_base::binary);
+    while(inputFile.hasNextChunk())
+    {
+        auto data = inputFile.readNextChunk();
+        outputFile.write(data.data(), data.size());
+    }
+}
+
+struct PlainEntry
+{
+    Position pos;
+    Move move;
+    std::int16_t score;
+    std::uint16_t ply;
+    std::int16_t result;
+};
+
+struct PackedEntry
+{
+    unsigned char bytes[30];
+};
+
+std::uint16_t signedToUnsigned(std::int16_t a)
+{
+    std::uint16_t r;
+    std::memcpy(&r, &a, sizeof(std::uint16_t));
+    if (r & 0x8000)
+    {
+        r ^= 0x7FFF;
+    }
+    r = (r << 1) | (r >> 15);
+    return r;
+}
+
+std::int16_t unsignedToSigned(std::uint16_t r)
+{
+    std::int16_t a;
+    r = (r << 15) | (r >> 1);
+    if (r & 0x8000)
+    {
+        r ^= 0x7FFF;
+    }
+    std::memcpy(&a, &r, sizeof(std::uint16_t));
+    return a;
+}
+
+
+PackedEntry packEntry(const PlainEntry& plain)
+{
+    PackedEntry packed;
+
+    auto compressedPos = plain.pos.compress();
+    auto compressedMove = plain.move.compress();
+
+    static_assert(sizeof(compressedPos) + sizeof(compressedMove) + 4 == sizeof(PackedEntry));
+
+    std::size_t offset = 0;
+    compressedPos.writeToBigEndian(packed.bytes);
+    offset += sizeof(compressedPos);
+    compressedMove.writeToBigEndian(packed.bytes + offset);
+    offset += sizeof(compressedMove);
+    std::uint16_t pr = plain.ply | (signedToUnsigned(plain.result) << 14);
+    packed.bytes[offset++] = signedToUnsigned(plain.score) >> 8;
+    packed.bytes[offset++] = signedToUnsigned(plain.score);
+    packed.bytes[offset++] = pr >> 8;
+    packed.bytes[offset++] = pr;
+
+    return packed;
+}
+
+PlainEntry unpackEntry(const PackedEntry& packed)
+{
+    PlainEntry plain;
+
+    std::size_t offset = 0;
+    auto compressedPos = CompressedPosition::readFromBigEndian(packed.bytes);
+    plain.pos = compressedPos.decompress();
+    offset += sizeof(compressedPos);
+    auto compressedMove = CompressedMove::readFromBigEndian(packed.bytes + offset);
+    plain.move = compressedMove.decompress();
+    offset += sizeof(compressedMove);
+    plain.score = unsignedToSigned((packed.bytes[offset] << 8) | packed.bytes[offset+1]);
+    offset += 2;
+    std::uint16_t pr = (packed.bytes[offset] << 8) | packed.bytes[offset+1];
+    plain.ply = pr & 0x3FFF;
+    plain.result = unsignedToSigned(pr >> 14);
+    offset += 2;
+
+    return plain;
+}
+
+void compressPlain(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = sizeof(PackedEntry);
+    constexpr std::size_t chunkSize = MiB / entrySize * entrySize;
+
+    PlainEntry e;
+
+    std::string key;
+    std::string value;
+    std::string move;
+
+    std::ifstream inputFile(inputPath);
+    blosc2::CompressedFile outputFile(outputPath, entrySize);
+
+    std::vector<char> packedEntries(chunkSize);
+    std::size_t packedSize = 0;
+
+    for(;;)
+    {
+        inputFile >> key;
+        if (!inputFile)
+        {
+            break;
+        }
+
+        if (key == "e"sv)
+        {
+            e.move = uci::uciToMove(e.pos, move);
+
+            auto packed = packEntry(e);
+            std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedEntry));
+            packedSize += sizeof(PackedEntry);
+
+            if (packedSize == chunkSize)
+            {
+                outputFile.append(packedEntries.data(), packedSize);
+
+                packedEntries.clear();
+                packedSize = 0;
+            }
+
+            continue;
+        }
+
+        inputFile >> std::ws;
+        std::getline(inputFile, value, '\n');
+
+        if (key == "fen"sv) e.pos = Position::fromFen(value.c_str());
+        if (key == "move"sv) move = value;
+        if (key == "score"sv) e.score = std::stoi(value);
+        if (key == "ply"sv) e.ply = std::stoi(value);
+        if (key == "result"sv) e.result = std::stoi(value);
+    }
+
+    if (packedSize != 0)
+    {
+        outputFile.append(packedEntries.data(), packedSize);
+    }
+}
+
+void decompressPlain(std::string inputPath, std::string outputPath)
+{
+    constexpr std::size_t entrySize = sizeof(PackedEntry);
+
+    blosc2::CompressedFile inputFile(inputPath, entrySize);
+    std::ofstream outputFile(outputPath);
+    while(inputFile.hasNextChunk())
+    {
+        auto data = inputFile.readNextChunk();
+
+        for (std::size_t offset = 0; offset < data.size(); offset += sizeof(PackedEntry))
+        {
+            PackedEntry packed;
+            std::memcpy(&packed, data.data() + offset, sizeof(PackedEntry));
+            auto plain = unpackEntry(packed);
+            outputFile << "fen " << plain.pos.fen() << '\n';
+            outputFile << "move " << uci::moveToUci(plain.pos, plain.move) << '\n';
+            outputFile << "score " << plain.score << '\n';
+            outputFile << "ply " << plain.ply << '\n';
+            outputFile << "result " << plain.result << "\ne\n";
+        }
+    }
+}
+
+int main()
+{
+    compressBin("data.bin", "data.bin.blosc2");
+    decompressBin("data.bin.blosc2", "data_d.bin");
+
+    compressPlain("data.plain", "data.plain.blosc2");
+    decompressPlain("data.plain.blosc2", "data_d.plain");
+
+    compressPlain("data_d.plain", "data_d.plain.blosc2");
+    decompressPlain("data_d.plain.blosc2", "data_d2.plain");
+
+    // TODO: since most of the time the positions differ only by move try storing deltas whenever possible (so only move and score, the rest can be inferred)
+    // TODO: include 50 mr counter, restore ply
+    // TODO: store metadata, guard agains wrong usage
+    // TODO: allow specifying compression level
+    // TODO: CLI
+    // TODO: convert from bin to packed maybe?
+    // TODO: maybe optimize a bit
+    // TODO: cleanup
+
+  return 0;
+}
