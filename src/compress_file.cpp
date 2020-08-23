@@ -349,7 +349,7 @@ struct PackedMoveScoreListReader
 
     std::size_t numReadBytes()
     {
-        return m_readOffset + 1;
+        return m_readOffset + (m_readBitsLeft != 8);
     }
 
 private:
