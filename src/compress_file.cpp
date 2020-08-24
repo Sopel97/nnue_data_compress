@@ -25,8 +25,89 @@ using namespace std::literals;
 
 namespace nodchip
 {
-    struct PackedSfen { uint8_t data[32]; };
     using namespace std;
+
+    struct StockfishMove
+    {
+        std::uint16_t raw;
+
+        static StockfishMove fromMove(Move move)
+        {
+            StockfishMove sfm{0};
+
+            unsigned moveFlag = 0;
+            if (move.type == MoveType::Promotion) moveFlag = 1;
+            else if (move.type == MoveType::EnPassant) moveFlag = 2;
+            else if (move.type == MoveType::Castle) moveFlag = 3;
+
+            unsigned promotionIndex = 0;
+            if (move.type == MoveType::Promotion)
+            {
+                promotionIndex = static_cast<int>(move.promotedPiece.type()) - static_cast<int>(PieceType::Knight);
+            }
+
+            sfm.raw |= static_cast<std::uint16_t>(moveFlag);
+            sfm.raw <<= 2;
+            sfm.raw |= static_cast<std::uint16_t>(promotionIndex);
+            sfm.raw <<= 6;
+            sfm.raw |= static_cast<int>(move.from);
+            sfm.raw <<= 6;
+            sfm.raw |= static_cast<int>(move.to);
+
+            return sfm;
+        }
+
+        Move move() const
+        {
+            Square to = static_cast<Square>((raw & (0b111111 << 0) >> 0));
+            Square from = static_cast<Square>((raw & (0b111111 << 6)) >> 6);
+            unsigned promotionIndex = (raw & (0b11 << 12)) >> 12;
+            PieceType promotionType = static_cast<PieceType>(static_cast<int>(PieceType::Knight) + promotionIndex);
+            unsigned moveFlag = (raw & (0b11 << 14)) >> 14;
+            MoveType type = MoveType::Normal;
+            if (moveFlag == 1) type = MoveType::Promotion;
+            else if (moveFlag == 2) type = MoveType::EnPassant;
+            else if (moveFlag == 3) type = MoveType::Castle;
+
+            if (type == MoveType::Promotion)
+            {
+                Color stm = to.rank() == rank8 ? Color::White : Color::Black;
+                return Move{from, to, type, Piece(promotionType, stm)};
+            }
+            return Move{from, to, type};
+        }
+    };
+
+    static_assert(sizeof(StockfishMove) == sizeof(std::uint16_t));
+
+    struct PackedSfen { uint8_t data[32]; };
+    struct PackedSfenValue
+    {
+        // phase
+        PackedSfen sfen;
+
+        // Evaluation value returned from Learner::search()
+        int16_t score;
+
+        // PV first move
+        // Used when finding the match rate with the teacher
+        StockfishMove move;
+
+        // Trouble of the phase from the initial phase.
+        uint16_t gamePly;
+
+        // 1 if the player on this side ultimately wins the game. -1 if you are losing.
+        // 0 if a draw is reached.
+        // The draw is in the teacher position generation command gensfen,
+        // Only write if LEARN_GENSFEN_DRAW_RESULT is enabled.
+        int8_t game_result;
+
+        // When exchanging the file that wrote the teacher aspect with other people
+        //Because this structure size is not fixed, pad it so that it is 40 bytes in any environment.
+        uint8_t padding;
+
+        // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
+    };
     // Class that handles bitstream
 // useful when doing aspect encoding
 struct BitStream
@@ -140,12 +221,13 @@ struct HuffmanedPiece
 
 HuffmanedPiece huffman_table[] =
 {
-  {0b0000,1}, // NO_PIECE
-  {0b0001,4}, // PAWN
-  {0b0011,4}, // KNIGHT
-  {0b0101,4}, // BISHOP
-  {0b0111,4}, // ROOK
-  {0b1001,4}, // QUEEN
+  {0b0001,4}, // PAWN     1
+  {0b0011,4}, // KNIGHT   3
+  {0b0101,4}, // BISHOP   5
+  {0b0111,4}, // ROOK     7
+  {0b1001,4}, // QUEEN    9
+  {-1,-1}, // KING    9
+  {0b0000,1}, // NO_PIECE 0
 };
 
 // Class for compressing/decompressing sfen
@@ -253,7 +335,7 @@ struct SfenPacker
 
       assert(bits <= 6);
 
-      for (pr = static_cast<int>(PieceType::None); pr < static_cast<int>(PieceType::King); ++pr)
+      for (pr = static_cast<int>(PieceType::Pawn); pr <= static_cast<int>(PieceType::None); ++pr)
         if (huffman_table[pr].code == code
           && huffman_table[pr].bits == bits)
           goto Found;
