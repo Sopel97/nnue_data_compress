@@ -23,6 +23,252 @@ constexpr std::size_t maxChunkSize = 100*MiB; // to prevent malformed files from
 
 using namespace std::literals;
 
+namespace nodchip
+{
+    using namespace std;
+    // Class that handles bitstream
+// useful when doing aspect encoding
+struct BitStream
+{
+  // Set the memory to store the data in advance.
+  // Assume that memory is cleared to 0.
+  void  set_data(uint8_t* data_) { data = data_; reset(); }
+
+  // Get the pointer passed in set_data().
+  uint8_t* get_data() const { return data; }
+
+  // Get the cursor.
+  int get_cursor() const { return bit_cursor; }
+
+  // reset the cursor
+  void reset() { bit_cursor = 0; }
+
+  // Write 1bit to the stream.
+  // If b is non-zero, write out 1. If 0, write 0.
+  void write_one_bit(int b)
+  {
+    if (b)
+      data[bit_cursor / 8] |= 1 << (bit_cursor & 7);
+
+    ++bit_cursor;
+  }
+
+  // Get 1 bit from the stream.
+  int read_one_bit()
+  {
+    int b = (data[bit_cursor / 8] >> (bit_cursor & 7)) & 1;
+    ++bit_cursor;
+
+    return b;
+  }
+
+  // write n bits of data
+  // Data shall be written out from the lower order of d.
+  void write_n_bit(int d, int n)
+  {
+    for (int i = 0; i <n; ++i)
+      write_one_bit(d & (1 << i));
+  }
+
+  // read n bits of data
+  // Reverse conversion of write_n_bit().
+  int read_n_bit(int n)
+  {
+    int result = 0;
+    for (int i = 0; i < n; ++i)
+      result |= read_one_bit() ? (1 << i) : 0;
+
+    return result;
+  }
+
+private:
+  // Next bit position to read/write.
+  int bit_cursor;
+
+  // data entity
+  uint8_t* data;
+};
+
+
+// Huffman coding
+// * is simplified from mini encoding to make conversion easier.
+//
+// 1 box on the board (other than NO_PIECE) = 2 to 6 bits (+ 1-bit flag + 1-bit forward and backward)
+// 1 piece of hand piece = 1-5bit (+ 1-bit flag + 1bit ahead and behind)
+//
+// empty xxxxx0 + 0 (none)
+// step xxxx01 + 2 xxxx0 + 2
+// incense xx0011 + 2 xx001 + 2
+// Katsura xx1011 + 2 xx101 + 2
+// silver xx0111 + 2 xx011 + 2
+// Gold x01111 + 1 x0111 + 1 // Gold is valid and has no flags.
+// corner 011111 + 2 01111 + 2
+// Fly 111111 + 2 11111 + 2
+//
+// Assuming all pieces are on the board,
+// Sky 81-40 pieces = 41 boxes = 41bit
+// Walk 4bit*18 pieces = 72bit
+// Incense 6bit*4 pieces = 24bit
+// Katsura 6bit*4 pieces = 24bit
+// Silver 6bit*4 pieces = 24bit
+// Gold 6bit* 4 pieces = 24bit
+// corner 8bit* 2 pieces = 16bit
+// Fly 8bit* 2 pieces = 16bit
+// -------
+// 241bit + 1bit (turn) + 7bit × 2 (King's position after) = 256bit
+//
+// When the piece on the board moves to the hand piece, the piece on the board becomes empty, so the box on the board can be expressed with 1 bit,
+// Since the hand piece can be expressed by 1 bit less than the piece on the board, the total number of bits does not change in the end.
+// Therefore, in this expression, any aspect can be expressed by this bit number.
+// It is a hand piece and no flag is required, but if you include this, the bit number of the piece on the board will be -1
+// Since the total number of bits can be fixed, we will include this as well.
+
+// Huffman Encoding
+//
+// Empty  xxxxxxx0
+// Pawn   xxxxx001 + 1 bit (Side to move)
+// Knight xxxxx011 + 1 bit (Side to move)
+// Bishop xxxxx101 + 1 bit (Side to move)
+// Rook   xxxxx111 + 1 bit (Side to move)
+
+struct HuffmanedPiece
+{
+  int code; // how it will be coded
+  int bits; // How many bits do you have
+};
+
+HuffmanedPiece huffman_table[] =
+{
+  {0b0000,1}, // NO_PIECE
+  {0b0001,4}, // PAWN
+  {0b0011,4}, // KNIGHT
+  {0b0101,4}, // BISHOP
+  {0b0111,4}, // ROOK
+  {0b1001,4}, // QUEEN
+};
+
+// Class for compressing/decompressing sfen
+// sfen can be packed to 256bit (32bytes) by Huffman coding.
+// This is proven by mini. The above is Huffman coding.
+//
+// Internal format = 1-bit turn + 7-bit king position *2 + piece on board (Huffman coding) + hand piece (Huffman coding)
+// Side to move (White = 0, Black = 1) (1bit)
+// White King Position (6 bits)
+// Black King Position (6 bits)
+// Huffman Encoding of the board
+// Castling availability (1 bit x 4)
+// En passant square (1 or 1 + 6 bits)
+// Rule 50 (6 bits)
+// Game play (8 bits)
+//
+// TODO(someone): Rename SFEN to FEN.
+//
+struct SfenPacker
+{
+  // Pack sfen and store in data[32].
+  void pack(const Position& pos)
+  {
+// cout << pos;
+
+    memset(data, 0, 32 /* 256bit */);
+    stream.set_data(data);
+
+    // turn
+    // Side to move.
+    stream.write_one_bit((int)(pos.sideToMove()));
+
+    // 7-bit positions for leading and trailing balls
+    // White king and black king, 6 bits for each.
+    stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::White)), 6);
+    stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::Black)), 6);
+
+    // Write the pieces on the board other than the kings.
+    for (Rank r = rank8; r >= rank1; --r)
+    {
+      for (File f = fileA; f <= fileH; ++f)
+      {
+        Piece pc = pos.pieceAt(Square(f, r));
+        if (pc.type() == PieceType::King)
+          continue;
+        write_board_piece_to_stream(pc);
+      }
+    }
+
+    // TODO(someone): Support chess960.
+    auto cr = pos.castlingRights();
+    stream.write_one_bit(contains(cr, CastlingRights::WhiteKingSide));
+    stream.write_one_bit(contains(cr, CastlingRights::WhiteQueenSide));
+    stream.write_one_bit(contains(cr, CastlingRights::BlackKingSide));
+    stream.write_one_bit(contains(cr, CastlingRights::BlackQueenSide));
+
+    if (pos.epSquare() == Square::none()) {
+      stream.write_one_bit(0);
+    }
+    else {
+      stream.write_one_bit(1);
+      stream.write_n_bit(static_cast<int>(pos.epSquare()), 6);
+    }
+
+    stream.write_n_bit(pos.rule50Counter(), 6);
+
+    stream.write_n_bit(pos.halfMove(), 8);
+
+    assert(stream.get_cursor() <= 256);
+  }
+
+  // sfen packed by pack() (256bit = 32bytes)
+  // Or sfen to decode with unpack()
+  uint8_t *data; // uint8_t[32];
+
+//private:
+  // Position::set_from_packed_sfen(uint8_t data[32]) I want to use these functions, so the line is bad, but I want to keep it public.
+
+  BitStream stream;
+
+  // Output the board pieces to stream.
+  void write_board_piece_to_stream(Piece pc)
+  {
+    // piece type
+    PieceType pr = pc.type();
+    auto c = huffman_table[static_cast<int>(pr)];
+    stream.write_n_bit(c.code, c.bits);
+
+    if (pc == Piece::none())
+      return;
+
+    // first and second flag
+    stream.write_one_bit(static_cast<int>(pc.color()));
+  }
+
+  // Read one board piece from stream
+  Piece read_board_piece_from_stream()
+  {
+    int pr = static_cast<int>(PieceType::None);
+    int code = 0, bits = 0;
+    while (true)
+    {
+      code |= stream.read_one_bit() << bits;
+      ++bits;
+
+      assert(bits <= 6);
+
+      for (pr = static_cast<int>(PieceType::None); pr < static_cast<int>(PieceType::King); ++pr)
+        if (huffman_table[pr].code == code
+          && huffman_table[pr].bits == bits)
+          goto Found;
+    }
+  Found:;
+    if (pr == static_cast<int>(PieceType::None))
+      return Piece::none();
+
+    // first and second flag
+    Color c = (Color)stream.read_one_bit();
+
+    return Piece(static_cast<PieceType>(pr), c);
+  }
+};
+}
+
 struct CompressedTrainingDataFile
 {
     CompressedTrainingDataFile(std::string path, std::ios_base::openmode om = std::ios_base::app) :
