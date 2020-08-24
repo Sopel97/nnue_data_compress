@@ -108,6 +108,7 @@ namespace nodchip
 
         // 32 + 2 + 2 + 2 + 1 + 1 = 40bytes
     };
+    static_assert(sizeof(PackedSfenValue) == 40);
     // Class that handles bitstream
 // useful when doing aspect encoding
 struct BitStream
@@ -548,6 +549,23 @@ PlainEntry packedSfenValueToPlainEntry(const nodchip::PackedSfenValue& psv)
     ret.score = psv.score;
     ret.ply = psv.gamePly;
     ret.result = psv.game_result;
+
+    return ret;
+}
+
+nodchip::PackedSfenValue plainEntryToPackedSfenValue(const PlainEntry& plain)
+{
+    nodchip::PackedSfenValue ret;
+
+    nodchip::SfenPacker sp;
+    sp.data = reinterpret_cast<uint8_t*>(&ret.sfen);
+    sp.pack(plain.pos);
+
+    ret.score = plain.score;
+    ret.move = nodchip::StockfishMove::fromMove(plain.move);
+    ret.gamePly = plain.ply;
+    ret.game_result = plain.result;
+    ret.padding = 0xff;
 
     return ret;
 }
@@ -1172,6 +1190,151 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
     if (!buffer.empty())
     {
         outputFile << buffer;
+    }
+}
+
+
+void compressBin(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
+{
+    constexpr std::size_t chunkSize = suggestedChunkSize;
+
+    std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
+
+    PlainEntry e;
+
+    std::string key;
+    std::string value;
+    std::string move;
+
+    std::ifstream inputFile(inputPath, std::ios_base::binary);
+    CompressedTrainingDataFile outputFile(outputPath, om);
+
+    std::vector<char> packedEntries(chunkSize + maxMovelistSize);
+    std::size_t packedSize = 0;
+
+    PlainEntry lastEntry{};
+    lastEntry.ply = 0xFFFF; // so it's never a continuation
+    lastEntry.result = 0x7FFF;
+
+    PackedMoveScoreList movelist{};
+
+    auto writeMovelist = [&](){
+        packedEntries[packedSize++] = movelist.numPlies >> 8;
+        packedEntries[packedSize++] = movelist.numPlies;
+        if (movelist.numPlies > 0)
+        {
+            std::memcpy(packedEntries.data() + packedSize, movelist.movetext.data(), movelist.movetext.size());
+            packedSize += movelist.movetext.size();
+        }
+    };
+
+    bool anyEntry = false;
+
+    nodchip::PackedSfenValue psv;
+    for(;;)
+    {
+        inputFile.read(reinterpret_cast<char*>(&psv), sizeof(psv));
+        if (inputFile.gcount() != 40)
+        {
+            break;
+        }
+
+        e = packedSfenValueToPlainEntry(psv);
+
+        bool isCont = isContinuation(lastEntry, e);
+        if (isCont)
+        {
+            // add to movelist
+            movelist.addMoveScore(e.pos, e.move, e.score);
+        }
+        else
+        {
+            if (anyEntry)
+            {
+                writeMovelist();
+            }
+
+            if (packedSize >= chunkSize)
+            {
+                outputFile.append(packedEntries.data(), packedSize);
+
+                packedEntries.clear();
+                packedSize = 0;
+            }
+
+            auto packed = packEntry(e);
+            std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedEntry));
+            packedSize += sizeof(PackedEntry);
+
+            movelist.clear(e);
+
+            anyEntry = true;
+        }
+
+        lastEntry = e;
+    }
+
+    if (packedSize > 0)
+    {
+        writeMovelist();
+
+        outputFile.append(packedEntries.data(), packedSize);
+    }
+}
+
+void decompressBin(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
+{
+    constexpr std::size_t bufferSize = MiB;
+
+    std::cout << "Decompressing " << inputPath << " to " << outputPath << '\n';
+
+    CompressedTrainingDataFile inputFile(inputPath);
+    std::ofstream outputFile(outputPath, std::ios_base::binary | om);
+    std::vector<char> buffer;
+    buffer.reserve(bufferSize * 2);
+
+    auto printEntry = [&](const PlainEntry& plain)
+    {
+        auto psv = plainEntryToPackedSfenValue(plain);
+        const char* data = reinterpret_cast<const char*>(&psv);
+        buffer.insert(buffer.end(), data, data+sizeof(psv));
+    };
+
+    while(inputFile.hasNextChunk())
+    {
+        auto data = inputFile.readNextChunk();
+
+        for(std::size_t offset = 0; offset < data.size();)
+        {
+            PackedEntry packed;
+            std::memcpy(&packed, data.data() + offset, sizeof(PackedEntry));
+            offset += sizeof(PackedEntry);
+            std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
+            offset += 2;
+
+            auto plain = unpackEntry(packed);
+            printEntry(plain);
+
+            PackedMoveScoreListReader movelist(plain, reinterpret_cast<unsigned char*>(data.data()) + offset, numPlies);
+            for(int i = 0; i < numPlies; ++i)
+            {
+                auto entry = movelist.nextEntry();
+                printEntry(entry);
+            }
+
+            offset += movelist.numReadBytes();
+
+            if (buffer.size() > bufferSize)
+            {
+                outputFile.write(buffer.data(), buffer.size());
+                buffer.clear();
+            }
+        }
+    }
+
+    if (!buffer.empty())
+    {
+        outputFile.write(buffer.data(), buffer.size());
     }
 }
 
