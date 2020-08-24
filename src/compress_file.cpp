@@ -25,6 +25,7 @@ using namespace std::literals;
 
 namespace nodchip
 {
+    struct PackedSfen { uint8_t data[32]; };
     using namespace std;
     // Class that handles bitstream
 // useful when doing aspect encoding
@@ -267,6 +268,90 @@ struct SfenPacker
     return Piece(static_cast<PieceType>(pr), c);
   }
 };
+
+
+Position pos_from_packed_sfen(const PackedSfen& sfen)
+{
+    SfenPacker packer;
+    auto& stream = packer.stream;
+    stream.set_data((uint8_t*)&sfen);
+
+    Position pos{};
+
+    // Active color
+    pos.setSideToMove((Color)stream.read_one_bit());
+
+    // First the position of the ball
+    pos.place(Piece(PieceType::King, Color::White), static_cast<Square>(stream.read_n_bit(6)));
+    pos.place(Piece(PieceType::King, Color::Black), static_cast<Square>(stream.read_n_bit(6)));
+
+  // Piece placement
+  for (Rank r = rank8; r >= rank1; --r)
+  {
+    for (File f = fileA; f <= fileH; ++f)
+    {
+      auto sq = Square(f, r);
+
+      // it seems there are already balls
+      Piece pc;
+      if (pos.pieceAt(sq).type() != PieceType::King)
+      {
+        assert(pos.pieceAt(sq) == Piece::none());
+        pc = packer.read_board_piece_from_stream();
+      }
+      else
+      {
+        pc = pos.pieceAt(sq);
+      }
+
+      // There may be no pieces, so skip in that case.
+      if (pc == Piece::none())
+        continue;
+
+      if (pc.type() != PieceType::King)
+      {
+        pos.place(pc, sq);
+      }
+
+      if (stream.get_cursor()> 256)
+        throw std::runtime_error("Improperly encoded bin sfen");
+      //assert(stream.get_cursor() <= 256);
+    }
+  }
+
+  // Castling availability.
+  // TODO(someone): Support chess960.
+  CastlingRights cr = CastlingRights::None;
+  if (stream.read_one_bit()) {
+    cr |= CastlingRights::WhiteKingSide;
+  }
+  if (stream.read_one_bit()) {
+    cr |= CastlingRights::WhiteQueenSide;
+  }
+  if (stream.read_one_bit()) {
+    cr |= CastlingRights::BlackKingSide;
+  }
+  if (stream.read_one_bit()) {
+    cr |= CastlingRights::BlackQueenSide;
+  }
+  pos.setCastlingRights(cr);
+
+  // En passant square. Ignore if no pawn capture is possible
+  if (stream.read_one_bit()) {
+    Square ep_square = static_cast<Square>(stream.read_n_bit(6));
+    pos.setEpSquare(ep_square);
+  }
+
+  // Halfmove clock
+  pos.setRule50Counter(stream.read_n_bit(6));
+
+  // Fullmove number
+  pos.setHalfMove(stream.read_n_bit(8));
+
+  assert(stream.get_cursor() <= 256);
+
+  return pos;
+}
 }
 
 struct CompressedTrainingDataFile

@@ -865,6 +865,12 @@ struct Position : public Board
         m_epSquare = sq;
     }
 
+    void setEpSquare(Square sq)
+    {
+        m_epSquare = sq;
+        nullifyEpSquareIfNotPossible();
+    }
+
     constexpr void setSideToMove(Color color)
     {
         m_sideToMove = color;
@@ -927,6 +933,11 @@ struct Position : public Board
     [[nodiscard]] std::uint16_t halfMove() const
     {
         return (m_ply + 1) / 2;
+    }
+
+    void setHalfMove(std::uint16_t hm)
+    {
+        m_ply = 2 * hm - 1 + (m_sideToMove == Color::Black);
     }
 
     [[nodiscard]] bool isCheck() const;
