@@ -1376,7 +1376,7 @@ void compress(std::string inputPath, std::string outputPath, std::ios_base::open
 
     if (endsWith(inputPath, binExtension))
     {
-        std::cerr << "Conversion from " << binExtension << " is not supported yet. Only " << plainExtension << " is supported.\n";
+        compressBin(inputPath, outputPath, om);
     }
     else if (endsWith(inputPath, plainExtension))
     {
@@ -1398,7 +1398,7 @@ void decompress(std::string inputPath, std::string outputPath, std::ios_base::op
 
     if (endsWith(outputPath, binExtension))
     {
-        std::cerr << "Conversion to " << binExtension << " is not supported yet. Only " << plainExtension << " is supported.\n";
+        decompressBin(inputPath, outputPath, om);
     }
     else if (endsWith(outputPath, plainExtension))
     {
@@ -1418,11 +1418,7 @@ void convert(std::string inputPath, std::string outputPath, std::ios_base::openm
         return;
     }
 
-    if (endsWith(inputPath, binExtension))
-    {
-        std::cerr << "Conversion from " << binExtension << " is not supported yet. Only " << plainExtension << " is supported.\n";
-    }
-    else if (endsWith(inputPath, plainExtension))
+    if (endsWith(inputPath, plainExtension) || endsWith(inputPath, binExtension))
     {
         compress(inputPath, outputPath, om);
     }
@@ -1461,7 +1457,7 @@ void help()
     std::cout << "    nnue_data_compression data.binpack data.plain\n";
 }
 
-int run(
+[[nodiscard]] int run(
     const std::string& programName,
     const std::set<std::string>& flag,
     const std::vector<std::string>& pos)
@@ -1490,7 +1486,7 @@ int run(
     return 1;
 }
 
-std::pair<std::set<std::string>, std::vector<std::string>> readArgs(int argc, char** argv)
+[[nodiscard]] std::pair<std::set<std::string>, std::vector<std::string>> readArgs(int argc, char** argv)
 {
     std::set<std::string> flags;
     std::vector<std::string> pos;
@@ -1509,26 +1505,9 @@ std::pair<std::set<std::string>, std::vector<std::string>> readArgs(int argc, ch
 
     return {flags, pos};
 }
-void hexdump(void *ptr, int buflen) {
-  unsigned char *buf = (unsigned char*)ptr;
-  int i, j;
-  for (i=0; i<buflen; i+=16) {
-    printf("%06x: ", i);
-    for (j=0; j<16; j++)
-      if (i+j < buflen)
-        printf("%02x ", buf[i+j]);
-      else
-        printf("   ");
-    printf(" ");
-    for (j=0; j<16; j++)
-      if (i+j < buflen)
-        printf("%c", isprint(buf[i+j]) ? buf[i+j] : '.');
-    printf("\n");
-  }
-}
+
 int main(int argc, char** argv)
 {
-    /*
     try
     {
         auto [flag, pos] = readArgs(argc, argv);
@@ -1539,34 +1518,4 @@ int main(int argc, char** argv)
         std::cerr << e.what() << "\n";
         std::cerr << "Exiting...\n";
     }
-    */
-    /*
-auto fen = "r2q1rk1/1pp2pp1/p1nbpnp1/8/2BP2P1/2N1PQ1P/PP3P2/R1B2RK1 b - - 1 13";
-auto pos = Position::fromFen(fen);
-nodchip::PackedSfen sfen;
-nodchip::SfenPacker sp;
-sp.data = (uint8_t*)&sfen;
-sp.pack(pos);
-hexdump(sfen.data, 32);
-auto unpos = nodchip::pos_from_packed_sfen(sfen);
-//std::cout << unpos.fen() << '\n';
-*/
-    /*
-    nodchip::PackedSfenValue sfenv;
-    std::ifstream f("data.bin", std::ios_base::binary);
-    for (int i = 0; i < 100; ++i)
-    {
-    f.read(reinterpret_cast<char*>(&sfenv), 40);
-    hexdump(sfenv.sfen.data, 32);
-    auto e = packedSfenValueToPlainEntry(sfenv);
-    auto pos = nodchip::pos_from_packed_sfen(sfenv.sfen);
-    std::cout << pos.fen() << '\n';
-    std::cout << sfenv.score << '\n';
-    std::cout << uci::moveToUci(pos, sfenv.move.move()) << '\n';
-    std::cout << sfenv.gamePly << '\n';
-    std::cout << sfenv.game_result << '\n';
-    }
-    */
-    compressBin("asd.bin", "data.bin.binpack", std::ios_base::trunc);
-    decompressBin("data.bin.binpack", "asd2.bin", std::ios_base::trunc);
 }
