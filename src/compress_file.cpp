@@ -1162,18 +1162,7 @@ struct CompressedTrainingDataEntryReader
                 m_offset += m_movelistReader->numReadBytes();
                 m_movelistReader.reset();
 
-                if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
-                {
-                    if (m_inputFile.hasNextChunk())
-                    {
-                        m_chunk = m_inputFile.readNextChunk();
-                        m_offset = 0;
-                    }
-                    else
-                    {
-                        m_isEnd = true;
-                    }
-                }
+                fetchNextChunkIfNeeded();
             }
 
             return e;
@@ -1188,7 +1177,14 @@ struct CompressedTrainingDataEntryReader
 
         const auto e = unpackEntry(packed);
 
-        m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(m_chunk.data()) + m_offset, numPlies);
+        if (numPlies > 0)
+        {
+            m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(m_chunk.data()) + m_offset, numPlies);
+        }
+        else
+        {
+            fetchNextChunkIfNeeded();
+        }
 
         return e;
     }
@@ -1199,6 +1195,22 @@ private:
     std::optional<PackedMoveScoreListReader> m_movelistReader;
     std::size_t m_offset;
     bool m_isEnd;
+
+    void fetchNextChunkIfNeeded()
+    {
+        if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
+        {
+            if (m_inputFile.hasNextChunk())
+            {
+                m_chunk = m_inputFile.readNextChunk();
+                m_offset = 0;
+            }
+            else
+            {
+                m_isEnd = true;
+            }
+        }
+    }
 };
 
 void compressPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
