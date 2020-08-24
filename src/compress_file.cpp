@@ -25,15 +25,18 @@ using namespace std::literals;
 
 namespace nodchip
 {
+    // This namespace contains modified code from https://github.com/nodchip/Stockfish
+    // which is released under GPL v3 license https://www.gnu.org/licenses/gpl-3.0.html
+
     using namespace std;
 
     struct StockfishMove
     {
-        std::uint16_t raw;
-
-        static StockfishMove fromMove(Move move)
+        [[nodiscard]] static StockfishMove fromMove(Move move)
         {
-            StockfishMove sfm{0};
+            StockfishMove sfm;
+
+            sfm.m_raw = 0;
 
             unsigned moveFlag = 0;
             if (move.type == MoveType::Promotion) moveFlag = 1;
@@ -46,24 +49,26 @@ namespace nodchip
                 promotionIndex = static_cast<int>(move.promotedPiece.type()) - static_cast<int>(PieceType::Knight);
             }
 
-            sfm.raw |= static_cast<std::uint16_t>(moveFlag);
-            sfm.raw <<= 2;
-            sfm.raw |= static_cast<std::uint16_t>(promotionIndex);
-            sfm.raw <<= 6;
-            sfm.raw |= static_cast<int>(move.from);
-            sfm.raw <<= 6;
-            sfm.raw |= static_cast<int>(move.to);
+            sfm.m_raw |= static_cast<std::uint16_t>(moveFlag);
+            sfm.m_raw <<= 2;
+            sfm.m_raw |= static_cast<std::uint16_t>(promotionIndex);
+            sfm.m_raw <<= 6;
+            sfm.m_raw |= static_cast<int>(move.from);
+            sfm.m_raw <<= 6;
+            sfm.m_raw |= static_cast<int>(move.to);
 
             return sfm;
         }
 
-        Move move() const
+        [[nodiscard]] Move toMove() const
         {
-            Square to = static_cast<Square>((raw & (0b111111 << 0) >> 0));
-            Square from = static_cast<Square>((raw & (0b111111 << 6)) >> 6);
-            unsigned promotionIndex = (raw & (0b11 << 12)) >> 12;
-            PieceType promotionType = static_cast<PieceType>(static_cast<int>(PieceType::Knight) + promotionIndex);
-            unsigned moveFlag = (raw & (0b11 << 14)) >> 14;
+            const Square to = static_cast<Square>((m_raw & (0b111111 << 0) >> 0));
+            const Square from = static_cast<Square>((m_raw & (0b111111 << 6)) >> 6);
+
+            const unsigned promotionIndex = (m_raw & (0b11 << 12)) >> 12;
+            const PieceType promotionType = static_cast<PieceType>(static_cast<int>(PieceType::Knight) + promotionIndex);
+
+            const unsigned moveFlag = (m_raw & (0b11 << 14)) >> 14;
             MoveType type = MoveType::Normal;
             if (moveFlag == 1) type = MoveType::Promotion;
             else if (moveFlag == 2) type = MoveType::EnPassant;
@@ -71,16 +76,22 @@ namespace nodchip
 
             if (type == MoveType::Promotion)
             {
-                Color stm = to.rank() == rank8 ? Color::White : Color::Black;
+                const Color stm = to.rank() == rank8 ? Color::White : Color::Black;
                 return Move{from, to, type, Piece(promotionType, stm)};
             }
             return Move{from, to, type};
         }
-    };
 
+    private:
+        std::uint16_t m_raw;
+    };
     static_assert(sizeof(StockfishMove) == sizeof(std::uint16_t));
 
-    struct PackedSfen { uint8_t data[32]; };
+    struct PackedSfen
+    {
+        uint8_t data[32];
+    };
+
     struct PackedSfenValue
     {
         // phase
@@ -110,356 +121,359 @@ namespace nodchip
     };
     static_assert(sizeof(PackedSfenValue) == 40);
     // Class that handles bitstream
-// useful when doing aspect encoding
-struct BitStream
-{
-  // Set the memory to store the data in advance.
-  // Assume that memory is cleared to 0.
-  void  set_data(uint8_t* data_) { data = data_; reset(); }
 
-  // Get the pointer passed in set_data().
-  uint8_t* get_data() const { return data; }
-
-  // Get the cursor.
-  int get_cursor() const { return bit_cursor; }
-
-  // reset the cursor
-  void reset() { bit_cursor = 0; }
-
-  // Write 1bit to the stream.
-  // If b is non-zero, write out 1. If 0, write 0.
-  void write_one_bit(int b)
-  {
-    if (b)
-      data[bit_cursor / 8] |= 1 << (bit_cursor & 7);
-
-    ++bit_cursor;
-  }
-
-  // Get 1 bit from the stream.
-  int read_one_bit()
-  {
-    int b = (data[bit_cursor / 8] >> (bit_cursor & 7)) & 1;
-    ++bit_cursor;
-
-    return b;
-  }
-
-  // write n bits of data
-  // Data shall be written out from the lower order of d.
-  void write_n_bit(int d, int n)
-  {
-    for (int i = 0; i <n; ++i)
-      write_one_bit(d & (1 << i));
-  }
-
-  // read n bits of data
-  // Reverse conversion of write_n_bit().
-  int read_n_bit(int n)
-  {
-    int result = 0;
-    for (int i = 0; i < n; ++i)
-      result |= read_one_bit() ? (1 << i) : 0;
-
-    return result;
-  }
-
-private:
-  // Next bit position to read/write.
-  int bit_cursor;
-
-  // data entity
-  uint8_t* data;
-};
-
-
-// Huffman coding
-// * is simplified from mini encoding to make conversion easier.
-//
-// 1 box on the board (other than NO_PIECE) = 2 to 6 bits (+ 1-bit flag + 1-bit forward and backward)
-// 1 piece of hand piece = 1-5bit (+ 1-bit flag + 1bit ahead and behind)
-//
-// empty xxxxx0 + 0 (none)
-// step xxxx01 + 2 xxxx0 + 2
-// incense xx0011 + 2 xx001 + 2
-// Katsura xx1011 + 2 xx101 + 2
-// silver xx0111 + 2 xx011 + 2
-// Gold x01111 + 1 x0111 + 1 // Gold is valid and has no flags.
-// corner 011111 + 2 01111 + 2
-// Fly 111111 + 2 11111 + 2
-//
-// Assuming all pieces are on the board,
-// Sky 81-40 pieces = 41 boxes = 41bit
-// Walk 4bit*18 pieces = 72bit
-// Incense 6bit*4 pieces = 24bit
-// Katsura 6bit*4 pieces = 24bit
-// Silver 6bit*4 pieces = 24bit
-// Gold 6bit* 4 pieces = 24bit
-// corner 8bit* 2 pieces = 16bit
-// Fly 8bit* 2 pieces = 16bit
-// -------
-// 241bit + 1bit (turn) + 7bit × 2 (King's position after) = 256bit
-//
-// When the piece on the board moves to the hand piece, the piece on the board becomes empty, so the box on the board can be expressed with 1 bit,
-// Since the hand piece can be expressed by 1 bit less than the piece on the board, the total number of bits does not change in the end.
-// Therefore, in this expression, any aspect can be expressed by this bit number.
-// It is a hand piece and no flag is required, but if you include this, the bit number of the piece on the board will be -1
-// Since the total number of bits can be fixed, we will include this as well.
-
-// Huffman Encoding
-//
-// Empty  xxxxxxx0
-// Pawn   xxxxx001 + 1 bit (Side to move)
-// Knight xxxxx011 + 1 bit (Side to move)
-// Bishop xxxxx101 + 1 bit (Side to move)
-// Rook   xxxxx111 + 1 bit (Side to move)
-
-struct HuffmanedPiece
-{
-  int code; // how it will be coded
-  int bits; // How many bits do you have
-};
-
-HuffmanedPiece huffman_table[] =
-{
-  {0b0001,4}, // PAWN     1
-  {0b0011,4}, // KNIGHT   3
-  {0b0101,4}, // BISHOP   5
-  {0b0111,4}, // ROOK     7
-  {0b1001,4}, // QUEEN    9
-  {-1,-1}, // KING    9
-  {0b0000,1}, // NO_PIECE 0
-};
-
-// Class for compressing/decompressing sfen
-// sfen can be packed to 256bit (32bytes) by Huffman coding.
-// This is proven by mini. The above is Huffman coding.
-//
-// Internal format = 1-bit turn + 7-bit king position *2 + piece on board (Huffman coding) + hand piece (Huffman coding)
-// Side to move (White = 0, Black = 1) (1bit)
-// White King Position (6 bits)
-// Black King Position (6 bits)
-// Huffman Encoding of the board
-// Castling availability (1 bit x 4)
-// En passant square (1 or 1 + 6 bits)
-// Rule 50 (6 bits)
-// Game play (8 bits)
-//
-// TODO(someone): Rename SFEN to FEN.
-//
-struct SfenPacker
-{
-  // Pack sfen and store in data[32].
-  void pack(const Position& pos)
-  {
-// cout << pos;
-
-    memset(data, 0, 32 /* 256bit */);
-    stream.set_data(data);
-
-    // turn
-    // Side to move.
-    stream.write_one_bit((int)(pos.sideToMove()));
-
-    // 7-bit positions for leading and trailing balls
-    // White king and black king, 6 bits for each.
-    stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::White)), 6);
-    stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::Black)), 6);
-
-    // Write the pieces on the board other than the kings.
-    for (Rank r = rank8; r >= rank1; --r)
+    // useful when doing aspect encoding
+    struct BitStream
     {
-      for (File f = fileA; f <= fileH; ++f)
-      {
-        Piece pc = pos.pieceAt(Square(f, r));
-        if (pc.type() == PieceType::King)
-          continue;
-        write_board_piece_to_stream(pc);
-      }
-    }
+        // Set the memory to store the data in advance.
+        // Assume that memory is cleared to 0.
+        void  set_data(uint8_t* data_) { data = data_; reset(); }
 
-    // TODO(someone): Support chess960.
-    auto cr = pos.castlingRights();
-    stream.write_one_bit(contains(cr, CastlingRights::WhiteKingSide));
-    stream.write_one_bit(contains(cr, CastlingRights::WhiteQueenSide));
-    stream.write_one_bit(contains(cr, CastlingRights::BlackKingSide));
-    stream.write_one_bit(contains(cr, CastlingRights::BlackQueenSide));
+        // Get the pointer passed in set_data().
+        uint8_t* get_data() const { return data; }
 
-    if (pos.epSquare() == Square::none()) {
-      stream.write_one_bit(0);
-    }
-    else {
-      stream.write_one_bit(1);
-      stream.write_n_bit(static_cast<int>(pos.epSquare()), 6);
-    }
+        // Get the cursor.
+        int get_cursor() const { return bit_cursor; }
 
-    stream.write_n_bit(pos.rule50Counter(), 6);
+        // reset the cursor
+        void reset() { bit_cursor = 0; }
 
-    stream.write_n_bit(pos.halfMove(), 8);
+        // Write 1bit to the stream.
+        // If b is non-zero, write out 1. If 0, write 0.
+        void write_one_bit(int b)
+        {
+            if (b)
+                data[bit_cursor / 8] |= 1 << (bit_cursor & 7);
 
-    assert(stream.get_cursor() <= 256);
-  }
+            ++bit_cursor;
+        }
 
-  // sfen packed by pack() (256bit = 32bytes)
-  // Or sfen to decode with unpack()
-  uint8_t *data; // uint8_t[32];
+        // Get 1 bit from the stream.
+        int read_one_bit()
+        {
+            int b = (data[bit_cursor / 8] >> (bit_cursor & 7)) & 1;
+            ++bit_cursor;
 
-//private:
-  // Position::set_from_packed_sfen(uint8_t data[32]) I want to use these functions, so the line is bad, but I want to keep it public.
+            return b;
+        }
 
-  BitStream stream;
+        // write n bits of data
+        // Data shall be written out from the lower order of d.
+        void write_n_bit(int d, int n)
+        {
+            for (int i = 0; i <n; ++i)
+                write_one_bit(d & (1 << i));
+        }
 
-  // Output the board pieces to stream.
-  void write_board_piece_to_stream(Piece pc)
-  {
-    // piece type
-    PieceType pr = pc.type();
-    auto c = huffman_table[static_cast<int>(pr)];
-    stream.write_n_bit(c.code, c.bits);
+        // read n bits of data
+        // Reverse conversion of write_n_bit().
+        int read_n_bit(int n)
+        {
+            int result = 0;
+            for (int i = 0; i < n; ++i)
+                result |= read_one_bit() ? (1 << i) : 0;
 
-    if (pc == Piece::none())
-      return;
+            return result;
+        }
 
-    // first and second flag
-    stream.write_one_bit(static_cast<int>(pc.color()));
-  }
+    private:
+        // Next bit position to read/write.
+        int bit_cursor;
 
-  // Read one board piece from stream
-  Piece read_board_piece_from_stream()
-  {
-    int pr = static_cast<int>(PieceType::None);
-    int code = 0, bits = 0;
-    while (true)
+        // data entity
+        uint8_t* data;
+    };
+
+
+    // Huffman coding
+    // * is simplified from mini encoding to make conversion easier.
+    //
+    // 1 box on the board (other than NO_PIECE) = 2 to 6 bits (+ 1-bit flag + 1-bit forward and backward)
+    // 1 piece of hand piece = 1-5bit (+ 1-bit flag + 1bit ahead and behind)
+    //
+    // empty xxxxx0 + 0 (none)
+    // step xxxx01 + 2 xxxx0 + 2
+    // incense xx0011 + 2 xx001 + 2
+    // Katsura xx1011 + 2 xx101 + 2
+    // silver xx0111 + 2 xx011 + 2
+    // Gold x01111 + 1 x0111 + 1 // Gold is valid and has no flags.
+    // corner 011111 + 2 01111 + 2
+    // Fly 111111 + 2 11111 + 2
+    //
+    // Assuming all pieces are on the board,
+    // Sky 81-40 pieces = 41 boxes = 41bit
+    // Walk 4bit*18 pieces = 72bit
+    // Incense 6bit*4 pieces = 24bit
+    // Katsura 6bit*4 pieces = 24bit
+    // Silver 6bit*4 pieces = 24bit
+    // Gold 6bit* 4 pieces = 24bit
+    // corner 8bit* 2 pieces = 16bit
+    // Fly 8bit* 2 pieces = 16bit
+    // -------
+    // 241bit + 1bit (turn) + 7bit × 2 (King's position after) = 256bit
+    //
+    // When the piece on the board moves to the hand piece, the piece on the board becomes empty, so the box on the board can be expressed with 1 bit,
+    // Since the hand piece can be expressed by 1 bit less than the piece on the board, the total number of bits does not change in the end.
+    // Therefore, in this expression, any aspect can be expressed by this bit number.
+    // It is a hand piece and no flag is required, but if you include this, the bit number of the piece on the board will be -1
+    // Since the total number of bits can be fixed, we will include this as well.
+
+    // Huffman Encoding
+    //
+    // Empty  xxxxxxx0
+    // Pawn   xxxxx001 + 1 bit (Side to move)
+    // Knight xxxxx011 + 1 bit (Side to move)
+    // Bishop xxxxx101 + 1 bit (Side to move)
+    // Rook   xxxxx111 + 1 bit (Side to move)
+
+    struct HuffmanedPiece
     {
-      code |= stream.read_one_bit() << bits;
-      ++bits;
+        int code; // how it will be coded
+        int bits; // How many bits do you have
+    };
 
-      assert(bits <= 6);
-
-      for (pr = static_cast<int>(PieceType::Pawn); pr <= static_cast<int>(PieceType::None); ++pr)
-        if (huffman_table[pr].code == code
-          && huffman_table[pr].bits == bits)
-          goto Found;
-    }
-  Found:;
-    if (pr == static_cast<int>(PieceType::None))
-      return Piece::none();
-
-    // first and second flag
-    Color c = (Color)stream.read_one_bit();
-
-    return Piece(static_cast<PieceType>(pr), c);
-  }
-};
-
-
-Position pos_from_packed_sfen(const PackedSfen& sfen)
-{
-    SfenPacker packer;
-    auto& stream = packer.stream;
-    stream.set_data((uint8_t*)&sfen);
-
-    Position pos{};
-
-    // Active color
-    pos.setSideToMove((Color)stream.read_one_bit());
-
-    // First the position of the ball
-    pos.place(Piece(PieceType::King, Color::White), static_cast<Square>(stream.read_n_bit(6)));
-    pos.place(Piece(PieceType::King, Color::Black), static_cast<Square>(stream.read_n_bit(6)));
-
-  // Piece placement
-  for (Rank r = rank8; r >= rank1; --r)
-  {
-    for (File f = fileA; f <= fileH; ++f)
+    // NOTE: Order adjusted for this library because originally NO_PIECE had index 0
+    constexpr HuffmanedPiece huffman_table[] =
     {
-      auto sq = Square(f, r);
+        {0b0001,4}, // PAWN     1
+        {0b0011,4}, // KNIGHT   3
+        {0b0101,4}, // BISHOP   5
+        {0b0111,4}, // ROOK     7
+        {0b1001,4}, // QUEEN    9
+        {-1,-1},    // KING - unused
+        {0b0000,1}, // NO_PIECE 0
+    };
 
-      // it seems there are already balls
-      Piece pc;
-      if (pos.pieceAt(sq).type() != PieceType::King)
-      {
-        assert(pos.pieceAt(sq) == Piece::none());
-        pc = packer.read_board_piece_from_stream();
-      }
-      else
-      {
-        pc = pos.pieceAt(sq);
-      }
+    // Class for compressing/decompressing sfen
+    // sfen can be packed to 256bit (32bytes) by Huffman coding.
+    // This is proven by mini. The above is Huffman coding.
+    //
+    // Internal format = 1-bit turn + 7-bit king position *2 + piece on board (Huffman coding) + hand piece (Huffman coding)
+    // Side to move (White = 0, Black = 1) (1bit)
+    // White King Position (6 bits)
+    // Black King Position (6 bits)
+    // Huffman Encoding of the board
+    // Castling availability (1 bit x 4)
+    // En passant square (1 or 1 + 6 bits)
+    // Rule 50 (6 bits)
+    // Game play (8 bits)
+    //
+    // TODO(someone): Rename SFEN to FEN.
+    //
+    struct SfenPacker
+    {
+        // Pack sfen and store in data[32].
+        void pack(const Position& pos)
+        {
+            memset(data, 0, 32 /* 256bit */);
+            stream.set_data(data);
 
-      // There may be no pieces, so skip in that case.
-      if (pc == Piece::none())
-        continue;
+            // turn
+            // Side to move.
+            stream.write_one_bit((int)(pos.sideToMove()));
 
-      if (pc.type() != PieceType::King)
-      {
-        pos.place(pc, sq);
-      }
+            // 7-bit positions for leading and trailing balls
+            // White king and black king, 6 bits for each.
+            stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::White)), 6);
+            stream.write_n_bit(static_cast<int>(pos.kingSquare(Color::Black)), 6);
 
-      if (stream.get_cursor()> 256)
-        throw std::runtime_error("Improperly encoded bin sfen");
-      //assert(stream.get_cursor() <= 256);
+            // Write the pieces on the board other than the kings.
+            for (Rank r = rank8; r >= rank1; --r)
+            {
+                for (File f = fileA; f <= fileH; ++f)
+                {
+                    Piece pc = pos.pieceAt(Square(f, r));
+                    if (pc.type() == PieceType::King)
+                        continue;
+                    write_board_piece_to_stream(pc);
+                }
+            }
+
+            // TODO(someone): Support chess960.
+            auto cr = pos.castlingRights();
+            stream.write_one_bit(contains(cr, CastlingRights::WhiteKingSide));
+            stream.write_one_bit(contains(cr, CastlingRights::WhiteQueenSide));
+            stream.write_one_bit(contains(cr, CastlingRights::BlackKingSide));
+            stream.write_one_bit(contains(cr, CastlingRights::BlackQueenSide));
+
+            if (pos.epSquare() == Square::none()) {
+                stream.write_one_bit(0);
+            }
+            else {
+                stream.write_one_bit(1);
+                stream.write_n_bit(static_cast<int>(pos.epSquare()), 6);
+            }
+
+            stream.write_n_bit(pos.rule50Counter(), 6);
+
+            stream.write_n_bit(pos.halfMove(), 8);
+
+            assert(stream.get_cursor() <= 256);
+        }
+
+        // sfen packed by pack() (256bit = 32bytes)
+        // Or sfen to decode with unpack()
+        uint8_t *data; // uint8_t[32];
+
+        BitStream stream;
+
+        // Output the board pieces to stream.
+        void write_board_piece_to_stream(Piece pc)
+        {
+            // piece type
+            PieceType pr = pc.type();
+            auto c = huffman_table[static_cast<int>(pr)];
+            stream.write_n_bit(c.code, c.bits);
+
+            if (pc == Piece::none())
+                return;
+
+            // first and second flag
+            stream.write_one_bit(static_cast<int>(pc.color()));
+        }
+
+        // Read one board piece from stream
+        [[nodiscard]] Piece read_board_piece_from_stream()
+        {
+            int pr = static_cast<int>(PieceType::None);
+            int code = 0, bits = 0;
+            while (true)
+            {
+                code |= stream.read_one_bit() << bits;
+                ++bits;
+
+                assert(bits <= 6);
+
+                for (pr = static_cast<int>(PieceType::Pawn); pr <= static_cast<int>(PieceType::None); ++pr)
+                    if (huffman_table[pr].code == code
+                        && huffman_table[pr].bits == bits)
+                        goto Found;
+            }
+        Found:;
+            if (pr == static_cast<int>(PieceType::None))
+                return Piece::none();
+
+            // first and second flag
+            Color c = (Color)stream.read_one_bit();
+
+            return Piece(static_cast<PieceType>(pr), c);
+        }
+    };
+
+
+    [[nodiscard]] Position pos_from_packed_sfen(const PackedSfen& sfen)
+    {
+        SfenPacker packer;
+        auto& stream = packer.stream;
+        stream.set_data((uint8_t*)&sfen);
+
+        Position pos{};
+
+        // Active color
+        pos.setSideToMove((Color)stream.read_one_bit());
+
+        // First the position of the ball
+        pos.place(Piece(PieceType::King, Color::White), static_cast<Square>(stream.read_n_bit(6)));
+        pos.place(Piece(PieceType::King, Color::Black), static_cast<Square>(stream.read_n_bit(6)));
+
+        // Piece placement
+        for (Rank r = rank8; r >= rank1; --r)
+        {
+            for (File f = fileA; f <= fileH; ++f)
+            {
+                auto sq = Square(f, r);
+
+                // it seems there are already balls
+                Piece pc;
+                if (pos.pieceAt(sq).type() != PieceType::King)
+                {
+                    assert(pos.pieceAt(sq) == Piece::none());
+                    pc = packer.read_board_piece_from_stream();
+                }
+                else
+                {
+                    pc = pos.pieceAt(sq);
+                }
+
+                // There may be no pieces, so skip in that case.
+                if (pc == Piece::none())
+                    continue;
+
+                if (pc.type() != PieceType::King)
+                {
+                    pos.place(pc, sq);
+                }
+
+                if (stream.get_cursor()> 256)
+                    throw std::runtime_error("Improperly encoded bin sfen");
+                //assert(stream.get_cursor() <= 256);
+            }
+        }
+
+        // Castling availability.
+        CastlingRights cr = CastlingRights::None;
+        if (stream.read_one_bit()) {
+            cr |= CastlingRights::WhiteKingSide;
+        }
+        if (stream.read_one_bit()) {
+            cr |= CastlingRights::WhiteQueenSide;
+        }
+        if (stream.read_one_bit()) {
+            cr |= CastlingRights::BlackKingSide;
+        }
+        if (stream.read_one_bit()) {
+            cr |= CastlingRights::BlackQueenSide;
+        }
+        pos.setCastlingRights(cr);
+
+        // En passant square. Ignore if no pawn capture is possible
+        if (stream.read_one_bit()) {
+            Square ep_square = static_cast<Square>(stream.read_n_bit(6));
+            pos.setEpSquare(ep_square);
+        }
+
+        // Halfmove clock
+        pos.setRule50Counter(stream.read_n_bit(6));
+
+        // Fullmove number
+        pos.setHalfMove(stream.read_n_bit(8));
+
+        if (stream.get_cursor()> 256)
+            throw std::runtime_error("Improperly encoded bin sfen");
+        //assert(stream.get_cursor() <= 256);
+
+        return pos;
     }
-  }
-
-  // Castling availability.
-  // TODO(someone): Support chess960.
-  CastlingRights cr = CastlingRights::None;
-  if (stream.read_one_bit()) {
-    cr |= CastlingRights::WhiteKingSide;
-  }
-  if (stream.read_one_bit()) {
-    cr |= CastlingRights::WhiteQueenSide;
-  }
-  if (stream.read_one_bit()) {
-    cr |= CastlingRights::BlackKingSide;
-  }
-  if (stream.read_one_bit()) {
-    cr |= CastlingRights::BlackQueenSide;
-  }
-  pos.setCastlingRights(cr);
-
-  // En passant square. Ignore if no pawn capture is possible
-  if (stream.read_one_bit()) {
-    Square ep_square = static_cast<Square>(stream.read_n_bit(6));
-    pos.setEpSquare(ep_square);
-  }
-
-  // Halfmove clock
-  pos.setRule50Counter(stream.read_n_bit(6));
-
-  // Fullmove number
-  pos.setHalfMove(stream.read_n_bit(8));
-
-  assert(stream.get_cursor() <= 256);
-
-  return pos;
-}
 }
 
 struct CompressedTrainingDataFile
 {
+    struct Header
+    {
+        std::uint32_t chunkSize;
+    };
+
     CompressedTrainingDataFile(std::string path, std::ios_base::openmode om = std::ios_base::app) :
         m_path(std::move(path)),
         m_file(m_path, std::ios_base::binary | std::ios_base::in | std::ios_base::out | om)
     {
     }
 
-    void append(const char* data, std::size_t size)
+    void append(const char* data, std::uint32_t size)
     {
-        writeChunkHeader(size);
+        writeChunkHeader({size});
         m_file.write(data, size);
     }
 
-    bool hasNextChunk()
+    [[nodiscard]] bool hasNextChunk()
     {
         m_file.peek();
         return !m_file.eof();
     }
 
-    std::vector<unsigned char> readNextChunk()
+    [[nodiscard]] std::vector<unsigned char> readNextChunk()
     {
-        auto size = readChunkHeader();
+        auto size = readChunkHeader().chunkSize;
         std::vector<unsigned char> data(size);
         m_file.read(reinterpret_cast<char*>(data.data()), size);
         return data;
@@ -469,21 +483,21 @@ private:
     std::string m_path;
     std::fstream m_file;
 
-    void writeChunkHeader(unsigned size)
+    void writeChunkHeader(Header h)
     {
         unsigned char header[8];
         header[0] = 'B';
         header[1] = 'I';
         header[2] = 'N';
         header[3] = 'P';
-        header[4] = size;
-        header[5] = size >> 8;
-        header[6] = size >> 16;
-        header[7] = size >> 24;
+        header[4] = h.chunkSize;
+        header[5] = h.chunkSize >> 8;
+        header[6] = h.chunkSize >> 16;
+        header[7] = h.chunkSize >> 24;
         m_file.write(reinterpret_cast<const char*>(header), 8);
     }
 
-    unsigned readChunkHeader()
+    [[nodiscard]] Header readChunkHeader()
     {
         unsigned char header[8];
         m_file.read(reinterpret_cast<char*>(header), 8);
@@ -492,7 +506,7 @@ private:
             throw std::runtime_error("Invalid binpack file or chunk.");
         }
 
-        unsigned size =
+        const std::uint32_t size =
             header[4]
             | (header[5] << 8)
             | (header[6] << 16)
@@ -503,11 +517,11 @@ private:
             throw std::runtime_error("Chunks size larger than supported. Malformed file?");
         }
 
-        return size;
+        return { size };
     }
 };
 
-std::uint16_t signedToUnsigned(std::int16_t a)
+[[nodiscard]] std::uint16_t signedToUnsigned(std::int16_t a)
 {
     std::uint16_t r;
     std::memcpy(&r, &a, sizeof(std::uint16_t));
@@ -519,7 +533,7 @@ std::uint16_t signedToUnsigned(std::int16_t a)
     return r;
 }
 
-std::int16_t unsignedToSigned(std::uint16_t r)
+[[nodiscard]] std::int16_t unsignedToSigned(std::uint16_t r)
 {
     std::int16_t a;
     r = (r << 15) | (r >> 1);
@@ -531,7 +545,7 @@ std::int16_t unsignedToSigned(std::uint16_t r)
     return a;
 }
 
-struct PlainEntry
+struct TrainingDataEntry
 {
     Position pos;
     Move move;
@@ -540,12 +554,12 @@ struct PlainEntry
     std::int16_t result;
 };
 
-PlainEntry packedSfenValueToPlainEntry(const nodchip::PackedSfenValue& psv)
+[[nodiscard]] TrainingDataEntry packedSfenValueToTrainingDataEntry(const nodchip::PackedSfenValue& psv)
 {
-    PlainEntry ret;
+    TrainingDataEntry ret;
 
     ret.pos = nodchip::pos_from_packed_sfen(psv.sfen);
-    ret.move = psv.move.move();
+    ret.move = psv.move.toMove();
     ret.score = psv.score;
     ret.ply = psv.gamePly;
     ret.result = psv.game_result;
@@ -553,7 +567,7 @@ PlainEntry packedSfenValueToPlainEntry(const nodchip::PackedSfenValue& psv)
     return ret;
 }
 
-nodchip::PackedSfenValue plainEntryToPackedSfenValue(const PlainEntry& plain)
+[[nodiscard]] nodchip::PackedSfenValue trainingDataEntryToPackedSfenValue(const TrainingDataEntry& plain)
 {
     nodchip::PackedSfenValue ret;
 
@@ -565,12 +579,12 @@ nodchip::PackedSfenValue plainEntryToPackedSfenValue(const PlainEntry& plain)
     ret.move = nodchip::StockfishMove::fromMove(plain.move);
     ret.gamePly = plain.ply;
     ret.game_result = plain.result;
-    ret.padding = 0xff;
+    ret.padding = 0xff; // for consistency with the .bin format.
 
     return ret;
 }
 
-bool isContinuation(const PlainEntry& lhs, const PlainEntry& rhs)
+[[nodiscard]] bool isContinuation(const TrainingDataEntry& lhs, const TrainingDataEntry& rhs)
 {
     return
         lhs.result == -rhs.result
@@ -578,12 +592,12 @@ bool isContinuation(const PlainEntry& lhs, const PlainEntry& rhs)
         && lhs.pos.afterMove(lhs.move) == rhs.pos;
 }
 
-struct PackedEntry
+struct PackedTrainingDataEntry
 {
     unsigned char bytes[32];
 };
 
-std::size_t usedBitsSafe(std::size_t value)
+[[nodiscard]] std::size_t usedBitsSafe(std::size_t value)
 {
     if (value == 0) return 0;
     return util::usedBits(value - 1);
@@ -593,11 +607,11 @@ static constexpr std::size_t scoreVleBlockSize = 4;
 
 struct PackedMoveScoreListReader
 {
-    PlainEntry entry;
+    TrainingDataEntry entry;
     std::uint16_t numPlies;
     unsigned char* movetext;
 
-    PackedMoveScoreListReader(const PlainEntry& entry, unsigned char* movetext, std::uint16_t numPlies) :
+    PackedMoveScoreListReader(const TrainingDataEntry& entry, unsigned char* movetext, std::uint16_t numPlies) :
         entry(entry),
         movetext(movetext),
         numPlies(numPlies),
@@ -633,7 +647,7 @@ struct PackedMoveScoreListReader
         return bits;
     }
 
-    std::uint16_t extractVle16(std::size_t blockSize)
+    [[nodiscard]] std::uint16_t extractVle16(std::size_t blockSize)
     {
         auto mask = (1 << blockSize) - 1;
         std::uint16_t v = 0;
@@ -652,7 +666,7 @@ struct PackedMoveScoreListReader
         return v;
     }
 
-    PlainEntry nextEntry()
+    [[nodiscard]] TrainingDataEntry nextEntry()
     {
         entry.pos.doMove(entry.move);
         auto [move, score] = nextMoveScore(entry.pos);
@@ -663,7 +677,7 @@ struct PackedMoveScoreListReader
         return entry;
     }
 
-    std::pair<Move, std::int16_t> nextMoveScore(const Position& pos)
+    [[nodiscard]] std::pair<Move, std::int16_t> nextMoveScore(const Position& pos)
     {
         Move move;
         std::int16_t score;
@@ -791,7 +805,7 @@ struct PackedMoveScoreListReader
         return {move, score};
     }
 
-    std::size_t numReadBytes()
+    [[nodiscard]] std::size_t numReadBytes()
     {
         return m_readOffset + (m_readBitsLeft != 8);
     }
@@ -807,7 +821,7 @@ struct PackedMoveScoreList
     std::uint16_t numPlies = 0;
     std::vector<unsigned char> movetext;
 
-    void clear(const PlainEntry& e)
+    void clear(const TrainingDataEntry& e)
     {
         numPlies = 0;
         movetext.clear();
@@ -972,14 +986,14 @@ private:
 };
 
 
-PackedEntry packEntry(const PlainEntry& plain)
+[[nodiscard]] PackedTrainingDataEntry packEntry(const TrainingDataEntry& plain)
 {
-    PackedEntry packed;
+    PackedTrainingDataEntry packed;
 
     auto compressedPos = plain.pos.compress();
     auto compressedMove = plain.move.compress();
 
-    static_assert(sizeof(compressedPos) + sizeof(compressedMove) + 6 == sizeof(PackedEntry));
+    static_assert(sizeof(compressedPos) + sizeof(compressedMove) + 6 == sizeof(PackedTrainingDataEntry));
 
     std::size_t offset = 0;
     compressedPos.writeToBigEndian(packed.bytes);
@@ -997,9 +1011,9 @@ PackedEntry packEntry(const PlainEntry& plain)
     return packed;
 }
 
-PlainEntry unpackEntry(const PackedEntry& packed)
+[[nodiscard]] TrainingDataEntry unpackEntry(const PackedTrainingDataEntry& packed)
 {
-    PlainEntry plain;
+    TrainingDataEntry plain;
 
     std::size_t offset = 0;
     auto compressedPos = CompressedPosition::readFromBigEndian(packed.bytes);
@@ -1026,7 +1040,7 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
 
-    PlainEntry e;
+    TrainingDataEntry e;
 
     std::string key;
     std::string value;
@@ -1038,7 +1052,7 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
     std::vector<char> packedEntries(chunkSize + maxMovelistSize);
     std::size_t packedSize = 0;
 
-    PlainEntry lastEntry{};
+    TrainingDataEntry lastEntry{};
     lastEntry.ply = 0xFFFF; // so it's never a continuation
     lastEntry.result = 0x7FFF;
 
@@ -1090,8 +1104,8 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
                 }
 
                 auto packed = packEntry(e);
-                std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedEntry));
-                packedSize += sizeof(PackedEntry);
+                std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedTrainingDataEntry));
+                packedSize += sizeof(PackedTrainingDataEntry);
 
                 movelist.clear(e);
 
@@ -1132,7 +1146,7 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
     std::string buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto printEntry = [&](const PlainEntry& plain)
+    auto printEntry = [&](const TrainingDataEntry& plain)
     {
         buffer += "fen ";
         buffer += plain.pos.fen();
@@ -1161,9 +1175,9 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
 
         for(std::size_t offset = 0; offset < data.size();)
         {
-            PackedEntry packed;
-            std::memcpy(&packed, data.data() + offset, sizeof(PackedEntry));
-            offset += sizeof(PackedEntry);
+            PackedTrainingDataEntry packed;
+            std::memcpy(&packed, data.data() + offset, sizeof(PackedTrainingDataEntry));
+            offset += sizeof(PackedTrainingDataEntry);
             std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
             offset += 2;
 
@@ -1200,7 +1214,7 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
 
-    PlainEntry e;
+    TrainingDataEntry e;
 
     std::string key;
     std::string value;
@@ -1212,7 +1226,7 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
     std::vector<char> packedEntries(chunkSize + maxMovelistSize);
     std::size_t packedSize = 0;
 
-    PlainEntry lastEntry{};
+    TrainingDataEntry lastEntry{};
     lastEntry.ply = 0xFFFF; // so it's never a continuation
     lastEntry.result = 0x7FFF;
 
@@ -1239,7 +1253,7 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
             break;
         }
 
-        e = packedSfenValueToPlainEntry(psv);
+        e = packedSfenValueToTrainingDataEntry(psv);
 
         bool isCont = isContinuation(lastEntry, e);
         if (isCont)
@@ -1263,8 +1277,8 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
             }
 
             auto packed = packEntry(e);
-            std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedEntry));
-            packedSize += sizeof(PackedEntry);
+            std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedTrainingDataEntry));
+            packedSize += sizeof(PackedTrainingDataEntry);
 
             movelist.clear(e);
 
@@ -1293,9 +1307,9 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
     std::vector<char> buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto printEntry = [&](const PlainEntry& plain)
+    auto printEntry = [&](const TrainingDataEntry& plain)
     {
-        auto psv = plainEntryToPackedSfenValue(plain);
+        auto psv = trainingDataEntryToPackedSfenValue(plain);
         const char* data = reinterpret_cast<const char*>(&psv);
         buffer.insert(buffer.end(), data, data+sizeof(psv));
     };
@@ -1306,9 +1320,9 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
 
         for(std::size_t offset = 0; offset < data.size();)
         {
-            PackedEntry packed;
-            std::memcpy(&packed, data.data() + offset, sizeof(PackedEntry));
-            offset += sizeof(PackedEntry);
+            PackedTrainingDataEntry packed;
+            std::memcpy(&packed, data.data() + offset, sizeof(PackedTrainingDataEntry));
+            offset += sizeof(PackedTrainingDataEntry);
             std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
             offset += 2;
 
@@ -1495,9 +1509,26 @@ std::pair<std::set<std::string>, std::vector<std::string>> readArgs(int argc, ch
 
     return {flags, pos};
 }
-
+void hexdump(void *ptr, int buflen) {
+  unsigned char *buf = (unsigned char*)ptr;
+  int i, j;
+  for (i=0; i<buflen; i+=16) {
+    printf("%06x: ", i);
+    for (j=0; j<16; j++)
+      if (i+j < buflen)
+        printf("%02x ", buf[i+j]);
+      else
+        printf("   ");
+    printf(" ");
+    for (j=0; j<16; j++)
+      if (i+j < buflen)
+        printf("%c", isprint(buf[i+j]) ? buf[i+j] : '.');
+    printf("\n");
+  }
+}
 int main(int argc, char** argv)
 {
+    /*
     try
     {
         auto [flag, pos] = readArgs(argc, argv);
@@ -1508,4 +1539,34 @@ int main(int argc, char** argv)
         std::cerr << e.what() << "\n";
         std::cerr << "Exiting...\n";
     }
+    */
+    /*
+auto fen = "r2q1rk1/1pp2pp1/p1nbpnp1/8/2BP2P1/2N1PQ1P/PP3P2/R1B2RK1 b - - 1 13";
+auto pos = Position::fromFen(fen);
+nodchip::PackedSfen sfen;
+nodchip::SfenPacker sp;
+sp.data = (uint8_t*)&sfen;
+sp.pack(pos);
+hexdump(sfen.data, 32);
+auto unpos = nodchip::pos_from_packed_sfen(sfen);
+//std::cout << unpos.fen() << '\n';
+*/
+    /*
+    nodchip::PackedSfenValue sfenv;
+    std::ifstream f("data.bin", std::ios_base::binary);
+    for (int i = 0; i < 100; ++i)
+    {
+    f.read(reinterpret_cast<char*>(&sfenv), 40);
+    hexdump(sfenv.sfen.data, 32);
+    auto e = packedSfenValueToPlainEntry(sfenv);
+    auto pos = nodchip::pos_from_packed_sfen(sfenv.sfen);
+    std::cout << pos.fen() << '\n';
+    std::cout << sfenv.score << '\n';
+    std::cout << uci::moveToUci(pos, sfenv.move.move()) << '\n';
+    std::cout << sfenv.gamePly << '\n';
+    std::cout << sfenv.game_result << '\n';
+    }
+    */
+    compressBin("asd.bin", "data.bin.binpack", std::ios_base::trunc);
+    decompressBin("data.bin.binpack", "asd2.bin", std::ios_base::trunc);
 }
