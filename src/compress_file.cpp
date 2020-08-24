@@ -1215,6 +1215,7 @@ private:
 
 void compressPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
 {
+    constexpr std::size_t reportEveryNPositions = 100'000;
     constexpr std::size_t chunkSize = suggestedChunkSize;
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
@@ -1227,6 +1228,8 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
     std::string move;
 
     std::ifstream inputFile(inputPath);
+    const auto base = inputFile.tellg();
+    std::size_t numProcessedPositions = 0;
 
     for(;;)
     {
@@ -1241,6 +1244,13 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
             e.move = uci::uciToMove(e.pos, move);
 
             writer.addTrainingDataEntry(e);
+
+            ++numProcessedPositions;
+            const auto cur = inputFile.tellg();
+            if (numProcessedPositions % reportEveryNPositions == 0)
+            {
+                std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+            }
 
             continue;
         }
@@ -1264,6 +1274,8 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
 
     CompressedTrainingDataEntryReader reader(inputPath);
     std::ofstream outputFile(outputPath, om);
+    const auto base = outputFile.tellp();
+    std::size_t numProcessedPositions = 0;
     std::string buffer;
     buffer.reserve(bufferSize * 2);
 
@@ -1294,22 +1306,31 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
     {
         emitEntry(reader.next());
 
+        ++numProcessedPositions;
+
         if (buffer.size() > bufferSize)
         {
             outputFile << buffer;
             buffer.clear();
+
+            const auto cur = outputFile.tellp();
+            std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
         }
     }
 
     if (!buffer.empty())
     {
         outputFile << buffer;
+
+        const auto cur = outputFile.tellp();
+        std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
     }
 }
 
 
 void compressBin(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
 {
+    constexpr std::size_t reportEveryNPositions = 100'000;
     constexpr std::size_t chunkSize = suggestedChunkSize;
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
@@ -1322,6 +1343,8 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
     std::string move;
 
     std::ifstream inputFile(inputPath, std::ios_base::binary);
+    const auto base = inputFile.tellg();
+    std::size_t numProcessedPositions = 0;
 
     nodchip::PackedSfenValue psv;
     for(;;)
@@ -1333,6 +1356,13 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
         }
 
         writer.addTrainingDataEntry(packedSfenValueToTrainingDataEntry(psv));
+
+        ++numProcessedPositions;
+        const auto cur = inputFile.tellg();
+        if (numProcessedPositions % reportEveryNPositions == 0)
+        {
+            std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+        }
     }
 }
 
@@ -1344,6 +1374,8 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
 
     CompressedTrainingDataEntryReader reader(inputPath);
     std::ofstream outputFile(outputPath, std::ios_base::binary | om);
+    const auto base = outputFile.tellp();
+    std::size_t numProcessedPositions = 0;
     std::vector<char> buffer;
     buffer.reserve(bufferSize * 2);
 
@@ -1358,16 +1390,24 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
     {
         emitEntry(reader.next());
 
+        ++numProcessedPositions;
+
         if (buffer.size() > bufferSize)
         {
             outputFile.write(buffer.data(), buffer.size());
             buffer.clear();
+
+            const auto cur = outputFile.tellp();
+            std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
         }
     }
 
     if (!buffer.empty())
     {
         outputFile.write(buffer.data(), buffer.size());
+
+        const auto cur = outputFile.tellp();
+        std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
     }
 }
 
