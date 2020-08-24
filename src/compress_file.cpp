@@ -539,6 +539,19 @@ struct PlainEntry
     std::int16_t result;
 };
 
+PlainEntry packedSfenValueToPlainEntry(const nodchip::PackedSfenValue& psv)
+{
+    PlainEntry ret;
+
+    ret.pos = nodchip::pos_from_packed_sfen(psv.sfen);
+    ret.move = psv.move.move();
+    ret.score = psv.score;
+    ret.ply = psv.gamePly;
+    ret.result = psv.game_result;
+
+    return ret;
+}
+
 bool isContinuation(const PlainEntry& lhs, const PlainEntry& rhs)
 {
     return
