@@ -677,6 +677,11 @@ struct PackedMoveScoreListReader
         return entry;
     }
 
+    [[nodiscard]] bool hasNext() const
+    {
+        return m_numReadPlies < numPlies;
+    }
+
     [[nodiscard]] std::pair<Move, std::int16_t> nextMoveScore(const Position& pos)
     {
         Move move;
@@ -802,6 +807,8 @@ struct PackedMoveScoreListReader
         score = m_lastScore + unsignedToSigned(extractVle16(scoreVleBlockSize));
         m_lastScore = -score;
 
+        ++m_numReadPlies;
+
         return {move, score};
     }
 
@@ -814,6 +821,7 @@ private:
     std::size_t m_readBitsLeft = 8;
     std::size_t m_readOffset = 0;
     std::int16_t m_lastScore = 0;
+    std::uint16_t m_numReadPlies = 0;
 };
 
 struct PackedMoveScoreList
@@ -1034,12 +1042,172 @@ private:
     return plain;
 }
 
+struct CompressedTrainingDataEntryWriter
+{
+    static constexpr std::size_t chunkSize = suggestedChunkSize;
+
+    CompressedTrainingDataEntryWriter(std::string path, std::ios_base::openmode om = std::ios_base::app) :
+        m_outputFile(path, om),
+        m_lastEntry{},
+        m_movelist{},
+        m_packedSize(0),
+        m_packedEntries(chunkSize + maxMovelistSize),
+        m_isFirst(true)
+    {
+        m_lastEntry.ply = 0xFFFF; // so it's never a continuation
+        m_lastEntry.result = 0x7FFF;
+    }
+
+    void addTrainingDataEntry(const TrainingDataEntry& e)
+    {
+        bool isCont = isContinuation(m_lastEntry, e);
+        if (isCont)
+        {
+            // add to movelist
+            m_movelist.addMoveScore(e.pos, e.move, e.score);
+        }
+        else
+        {
+            if (!m_isFirst)
+            {
+                writeMovelist();
+            }
+
+            if (m_packedSize >= chunkSize)
+            {
+                m_outputFile.append(m_packedEntries.data(), m_packedSize);
+                m_packedSize = 0;
+            }
+
+            auto packed = packEntry(e);
+            std::memcpy(m_packedEntries.data() + m_packedSize, &packed, sizeof(PackedTrainingDataEntry));
+            m_packedSize += sizeof(PackedTrainingDataEntry);
+
+            m_movelist.clear(e);
+
+            m_isFirst = false;
+        }
+
+        m_lastEntry = e;
+    }
+
+    ~CompressedTrainingDataEntryWriter()
+    {
+        if (m_packedSize > 0)
+        {
+            if (!m_isFirst)
+            {
+                writeMovelist();
+            }
+
+            m_outputFile.append(m_packedEntries.data(), m_packedSize);
+            m_packedSize = 0;
+        }
+    }
+
+private:
+    CompressedTrainingDataFile m_outputFile;
+    TrainingDataEntry m_lastEntry;
+    PackedMoveScoreList m_movelist;
+    std::size_t m_packedSize;
+    std::vector<char> m_packedEntries;
+    bool m_isFirst;
+
+    void writeMovelist()
+    {
+        m_packedEntries[m_packedSize++] = m_movelist.numPlies >> 8;
+        m_packedEntries[m_packedSize++] = m_movelist.numPlies;
+        if (m_movelist.numPlies > 0)
+        {
+            std::memcpy(m_packedEntries.data() + m_packedSize, m_movelist.movetext.data(), m_movelist.movetext.size());
+            m_packedSize += m_movelist.movetext.size();
+        }
+    };
+};
+
+struct CompressedTrainingDataEntryReader
+{
+    static constexpr std::size_t chunkSize = suggestedChunkSize;
+
+    CompressedTrainingDataEntryReader(std::string path, std::ios_base::openmode om = std::ios_base::app) :
+        m_inputFile(path, om),
+        m_chunk(),
+        m_movelistReader(std::nullopt),
+        m_offset(0),
+        m_isEnd(false)
+    {
+        if (!m_inputFile.hasNextChunk())
+        {
+            m_isEnd = true;
+        }
+        else
+        {
+            m_chunk = m_inputFile.readNextChunk();
+        }
+    }
+
+    [[nodiscard]] bool hasNext()
+    {
+        return !m_isEnd;
+    }
+
+    [[nodiscard]] TrainingDataEntry next()
+    {
+        if (m_movelistReader.has_value())
+        {
+            const auto e = m_movelistReader->nextEntry();
+
+            if (!m_movelistReader->hasNext())
+            {
+                m_offset += m_movelistReader->numReadBytes();
+                m_movelistReader.reset();
+
+                if (m_offset + sizeof(PackedTrainingDataEntry) + 2 > m_chunk.size())
+                {
+                    if (m_inputFile.hasNextChunk())
+                    {
+                        m_chunk = m_inputFile.readNextChunk();
+                        m_offset = 0;
+                    }
+                    else
+                    {
+                        m_isEnd = true;
+                    }
+                }
+            }
+
+            return e;
+        }
+
+        PackedTrainingDataEntry packed;
+        std::memcpy(&packed, m_chunk.data() + m_offset, sizeof(PackedTrainingDataEntry));
+        m_offset += sizeof(PackedTrainingDataEntry);
+
+        const std::uint16_t numPlies = (m_chunk[m_offset] << 8) | m_chunk[m_offset + 1];
+        m_offset += 2;
+
+        const auto e = unpackEntry(packed);
+
+        m_movelistReader.emplace(e, reinterpret_cast<unsigned char*>(m_chunk.data()) + m_offset, numPlies);
+
+        return e;
+    }
+
+private:
+    CompressedTrainingDataFile m_inputFile;
+    std::vector<unsigned char> m_chunk;
+    std::optional<PackedMoveScoreListReader> m_movelistReader;
+    std::size_t m_offset;
+    bool m_isEnd;
+};
+
 void compressPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
 {
     constexpr std::size_t chunkSize = suggestedChunkSize;
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
 
+    CompressedTrainingDataEntryWriter writer(outputPath, om);
     TrainingDataEntry e;
 
     std::string key;
@@ -1047,28 +1215,6 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
     std::string move;
 
     std::ifstream inputFile(inputPath);
-    CompressedTrainingDataFile outputFile(outputPath, om);
-
-    std::vector<char> packedEntries(chunkSize + maxMovelistSize);
-    std::size_t packedSize = 0;
-
-    TrainingDataEntry lastEntry{};
-    lastEntry.ply = 0xFFFF; // so it's never a continuation
-    lastEntry.result = 0x7FFF;
-
-    PackedMoveScoreList movelist{};
-
-    auto writeMovelist = [&](){
-        packedEntries[packedSize++] = movelist.numPlies >> 8;
-        packedEntries[packedSize++] = movelist.numPlies;
-        if (movelist.numPlies > 0)
-        {
-            std::memcpy(packedEntries.data() + packedSize, movelist.movetext.data(), movelist.movetext.size());
-            packedSize += movelist.movetext.size();
-        }
-    };
-
-    bool anyEntry = false;
 
     for(;;)
     {
@@ -1082,37 +1228,7 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
         {
             e.move = uci::uciToMove(e.pos, move);
 
-            bool isCont = isContinuation(lastEntry, e);
-            if (isCont)
-            {
-                // add to movelist
-                movelist.addMoveScore(e.pos, e.move, e.score);
-            }
-            else
-            {
-                if (anyEntry)
-                {
-                    writeMovelist();
-                }
-
-                if (packedSize >= chunkSize)
-                {
-                    outputFile.append(packedEntries.data(), packedSize);
-
-                    packedEntries.clear();
-                    packedSize = 0;
-                }
-
-                auto packed = packEntry(e);
-                std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedTrainingDataEntry));
-                packedSize += sizeof(PackedTrainingDataEntry);
-
-                movelist.clear(e);
-
-                anyEntry = true;
-            }
-
-            lastEntry = e;
+            writer.addTrainingDataEntry(e);
 
             continue;
         }
@@ -1126,13 +1242,6 @@ void compressPlain(std::string inputPath, std::string outputPath, std::ios_base:
         if (key == "ply"sv) e.ply = std::stoi(value);
         if (key == "result"sv) e.result = std::stoi(value);
     }
-
-    if (packedSize > 0)
-    {
-        writeMovelist();
-
-        outputFile.append(packedEntries.data(), packedSize);
-    }
 }
 
 void decompressPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
@@ -1141,12 +1250,12 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
 
     std::cout << "Decompressing " << inputPath << " to " << outputPath << '\n';
 
-    CompressedTrainingDataFile inputFile(inputPath);
+    CompressedTrainingDataEntryReader reader(inputPath);
     std::ofstream outputFile(outputPath, om);
     std::string buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto printEntry = [&](const TrainingDataEntry& plain)
+    auto emitEntry = [&](const TrainingDataEntry& plain)
     {
         buffer += "fen ";
         buffer += plain.pos.fen();
@@ -1169,35 +1278,14 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
         buffer += "\ne\n";
     };
 
-    while(inputFile.hasNextChunk())
+    while(reader.hasNext())
     {
-        auto data = inputFile.readNextChunk();
+        emitEntry(reader.next());
 
-        for(std::size_t offset = 0; offset < data.size();)
+        if (buffer.size() > bufferSize)
         {
-            PackedTrainingDataEntry packed;
-            std::memcpy(&packed, data.data() + offset, sizeof(PackedTrainingDataEntry));
-            offset += sizeof(PackedTrainingDataEntry);
-            std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
-            offset += 2;
-
-            auto plain = unpackEntry(packed);
-            printEntry(plain);
-
-            PackedMoveScoreListReader movelist(plain, reinterpret_cast<unsigned char*>(data.data()) + offset, numPlies);
-            for(int i = 0; i < numPlies; ++i)
-            {
-                auto entry = movelist.nextEntry();
-                printEntry(entry);
-            }
-
-            offset += movelist.numReadBytes();
-
-            if (buffer.size() > bufferSize)
-            {
-                outputFile << buffer;
-                buffer.clear();
-            }
+            outputFile << buffer;
+            buffer.clear();
         }
     }
 
@@ -1214,6 +1302,7 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
 
     std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
 
+    CompressedTrainingDataEntryWriter writer(outputPath, om);
     TrainingDataEntry e;
 
     std::string key;
@@ -1221,28 +1310,6 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
     std::string move;
 
     std::ifstream inputFile(inputPath, std::ios_base::binary);
-    CompressedTrainingDataFile outputFile(outputPath, om);
-
-    std::vector<char> packedEntries(chunkSize + maxMovelistSize);
-    std::size_t packedSize = 0;
-
-    TrainingDataEntry lastEntry{};
-    lastEntry.ply = 0xFFFF; // so it's never a continuation
-    lastEntry.result = 0x7FFF;
-
-    PackedMoveScoreList movelist{};
-
-    auto writeMovelist = [&](){
-        packedEntries[packedSize++] = movelist.numPlies >> 8;
-        packedEntries[packedSize++] = movelist.numPlies;
-        if (movelist.numPlies > 0)
-        {
-            std::memcpy(packedEntries.data() + packedSize, movelist.movetext.data(), movelist.movetext.size());
-            packedSize += movelist.movetext.size();
-        }
-    };
-
-    bool anyEntry = false;
 
     nodchip::PackedSfenValue psv;
     for(;;)
@@ -1253,46 +1320,7 @@ void compressBin(std::string inputPath, std::string outputPath, std::ios_base::o
             break;
         }
 
-        e = packedSfenValueToTrainingDataEntry(psv);
-
-        bool isCont = isContinuation(lastEntry, e);
-        if (isCont)
-        {
-            // add to movelist
-            movelist.addMoveScore(e.pos, e.move, e.score);
-        }
-        else
-        {
-            if (anyEntry)
-            {
-                writeMovelist();
-            }
-
-            if (packedSize >= chunkSize)
-            {
-                outputFile.append(packedEntries.data(), packedSize);
-
-                packedEntries.clear();
-                packedSize = 0;
-            }
-
-            auto packed = packEntry(e);
-            std::memcpy(packedEntries.data() + packedSize, &packed, sizeof(PackedTrainingDataEntry));
-            packedSize += sizeof(PackedTrainingDataEntry);
-
-            movelist.clear(e);
-
-            anyEntry = true;
-        }
-
-        lastEntry = e;
-    }
-
-    if (packedSize > 0)
-    {
-        writeMovelist();
-
-        outputFile.append(packedEntries.data(), packedSize);
+        writer.addTrainingDataEntry(packedSfenValueToTrainingDataEntry(psv));
     }
 }
 
@@ -1302,47 +1330,26 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
 
     std::cout << "Decompressing " << inputPath << " to " << outputPath << '\n';
 
-    CompressedTrainingDataFile inputFile(inputPath);
+    CompressedTrainingDataEntryReader reader(inputPath);
     std::ofstream outputFile(outputPath, std::ios_base::binary | om);
     std::vector<char> buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto printEntry = [&](const TrainingDataEntry& plain)
+    auto emitEntry = [&](const TrainingDataEntry& plain)
     {
         auto psv = trainingDataEntryToPackedSfenValue(plain);
         const char* data = reinterpret_cast<const char*>(&psv);
         buffer.insert(buffer.end(), data, data+sizeof(psv));
     };
 
-    while(inputFile.hasNextChunk())
+    while(reader.hasNext())
     {
-        auto data = inputFile.readNextChunk();
+        emitEntry(reader.next());
 
-        for(std::size_t offset = 0; offset < data.size();)
+        if (buffer.size() > bufferSize)
         {
-            PackedTrainingDataEntry packed;
-            std::memcpy(&packed, data.data() + offset, sizeof(PackedTrainingDataEntry));
-            offset += sizeof(PackedTrainingDataEntry);
-            std::uint16_t numPlies = (data[offset] << 8) | data[offset + 1];
-            offset += 2;
-
-            auto plain = unpackEntry(packed);
-            printEntry(plain);
-
-            PackedMoveScoreListReader movelist(plain, reinterpret_cast<unsigned char*>(data.data()) + offset, numPlies);
-            for(int i = 0; i < numPlies; ++i)
-            {
-                auto entry = movelist.nextEntry();
-                printEntry(entry);
-            }
-
-            offset += movelist.numReadBytes();
-
-            if (buffer.size() > bufferSize)
-            {
-                outputFile.write(buffer.data(), buffer.size());
-                buffer.clear();
-            }
+            outputFile.write(buffer.data(), buffer.size());
+            buffer.clear();
         }
     }
 
