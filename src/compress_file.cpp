@@ -1411,6 +1411,157 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
     }
 }
 
+void convertBinToPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
+{
+    constexpr std::size_t reportEveryNPositions = 100'000;
+    constexpr std::size_t bufferSize = MiB;
+
+    std::cout << "Converting " << inputPath << " to " << outputPath << '\n';
+
+    TrainingDataEntry e;
+
+    std::string key;
+    std::string value;
+    std::string move;
+
+    std::ifstream inputFile(inputPath, std::ios_base::binary);
+    const auto base = inputFile.tellg();
+    std::size_t numProcessedPositions = 0;
+
+    std::ofstream outputFile(outputPath, om);
+    std::string buffer;
+    buffer.reserve(bufferSize * 2);
+
+    auto emitEntry = [&](const TrainingDataEntry& plain)
+    {
+        buffer += "fen ";
+        buffer += plain.pos.fen();
+        buffer += '\n';
+
+        buffer += "move ";
+        buffer += uci::moveToUci(plain.pos, plain.move);
+        buffer += '\n';
+
+        buffer += "score ";
+        buffer += std::to_string(plain.score);
+        buffer += '\n';
+
+        buffer += "ply ";
+        buffer += std::to_string(plain.ply);
+        buffer += '\n';
+
+        buffer += "result ";
+        buffer += std::to_string(plain.result);
+        buffer += "\ne\n";
+    };
+
+    nodchip::PackedSfenValue psv;
+    for(;;)
+    {
+        inputFile.read(reinterpret_cast<char*>(&psv), sizeof(psv));
+        if (inputFile.gcount() != 40)
+        {
+            break;
+        }
+
+        emitEntry(packedSfenValueToTrainingDataEntry(psv));
+
+        ++numProcessedPositions;
+
+        if (buffer.size() > bufferSize)
+        {
+            outputFile << buffer;
+            buffer.clear();
+
+            const auto cur = outputFile.tellp();
+            std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+        }
+    }
+
+    if (!buffer.empty())
+    {
+        outputFile << buffer;
+
+        const auto cur = outputFile.tellp();
+        std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+    }
+}
+
+void convertPlainToBin(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
+{
+    constexpr std::size_t reportEveryNPositions = 100'000;
+    constexpr std::size_t bufferSize = MiB;
+
+    std::cout << "Compressing " << inputPath << " to " << outputPath << '\n';
+
+    std::ofstream outputFile(outputPath, std::ios_base::binary | om);
+    std::vector<char> buffer;
+    buffer.reserve(bufferSize * 2);
+
+    TrainingDataEntry e;
+
+    std::string key;
+    std::string value;
+    std::string move;
+
+    std::ifstream inputFile(inputPath);
+    const auto base = inputFile.tellg();
+    std::size_t numProcessedPositions = 0;
+
+    auto emitEntry = [&](const TrainingDataEntry& plain)
+    {
+        auto psv = trainingDataEntryToPackedSfenValue(plain);
+        const char* data = reinterpret_cast<const char*>(&psv);
+        buffer.insert(buffer.end(), data, data+sizeof(psv));
+    };
+
+    for(;;)
+    {
+        inputFile >> key;
+        if (!inputFile)
+        {
+            break;
+        }
+
+        if (key == "e"sv)
+        {
+            e.move = uci::uciToMove(e.pos, move);
+
+            emitEntry(e);
+
+            ++numProcessedPositions;
+
+            if (buffer.size() > bufferSize)
+            {
+                outputFile.write(buffer.data(), buffer.size());
+                buffer.clear();
+
+                const auto cur = outputFile.tellp();
+                std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+            }
+
+            continue;
+        }
+
+        inputFile >> std::ws;
+        std::getline(inputFile, value, '\n');
+
+        if (key == "fen"sv) e.pos = Position::fromFen(value.c_str());
+        if (key == "move"sv) move = value;
+        if (key == "score"sv) e.score = std::stoi(value);
+        if (key == "ply"sv) e.ply = std::stoi(value);
+        if (key == "result"sv) e.result = std::stoi(value);
+    }
+
+    if (!buffer.empty())
+    {
+        outputFile.write(buffer.data(), buffer.size());
+
+        const auto cur = outputFile.tellp();
+        std::cout << "Processed " << (cur - base) << " bytes and " << numProcessedPositions << " positions.\n";
+    }
+}
+
 const std::string plainExtension = ".plain";
 const std::string binExtension = ".bin";
 const std::string binpackExtension = ".binpack";
@@ -1477,7 +1628,15 @@ void convert(std::string inputPath, std::string outputPath, std::ios_base::openm
         return;
     }
 
-    if (endsWith(inputPath, plainExtension) || endsWith(inputPath, binExtension))
+    if (endsWith(inputPath, binExtension) && endsWith(outputPath, plainExtension))
+    {
+        convertBinToPlain(inputPath, outputPath, om);
+    }
+    else if (endsWith(inputPath, plainExtension) && endsWith(outputPath, binExtension))
+    {
+        convertPlainToBin(inputPath, outputPath, om);
+    }
+    else if (endsWith(inputPath, plainExtension) || endsWith(inputPath, binExtension))
     {
         compress(inputPath, outputPath, om);
     }
