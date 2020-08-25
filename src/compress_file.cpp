@@ -1213,6 +1213,36 @@ private:
     }
 };
 
+void emitPlainEntry(std::string& buffer, const TrainingDataEntry& plain)
+{
+    buffer += "fen ";
+    buffer += plain.pos.fen();
+    buffer += '\n';
+
+    buffer += "move ";
+    buffer += uci::moveToUci(plain.pos, plain.move);
+    buffer += '\n';
+
+    buffer += "score ";
+    buffer += std::to_string(plain.score);
+    buffer += '\n';
+
+    buffer += "ply ";
+    buffer += std::to_string(plain.ply);
+    buffer += '\n';
+
+    buffer += "result ";
+    buffer += std::to_string(plain.result);
+    buffer += "\ne\n";
+}
+
+void emitBinEntry(std::vector<char>& buffer, const TrainingDataEntry& plain)
+{
+    auto psv = trainingDataEntryToPackedSfenValue(plain);
+    const char* data = reinterpret_cast<const char*>(&psv);
+    buffer.insert(buffer.end(), data, data+sizeof(psv));
+}
+
 void compressPlain(std::string inputPath, std::string outputPath, std::ios_base::openmode om)
 {
     constexpr std::size_t reportEveryNPositions = 100'000;
@@ -1279,32 +1309,9 @@ void decompressPlain(std::string inputPath, std::string outputPath, std::ios_bas
     std::string buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto emitEntry = [&](const TrainingDataEntry& plain)
-    {
-        buffer += "fen ";
-        buffer += plain.pos.fen();
-        buffer += '\n';
-
-        buffer += "move ";
-        buffer += uci::moveToUci(plain.pos, plain.move);
-        buffer += '\n';
-
-        buffer += "score ";
-        buffer += std::to_string(plain.score);
-        buffer += '\n';
-
-        buffer += "ply ";
-        buffer += std::to_string(plain.ply);
-        buffer += '\n';
-
-        buffer += "result ";
-        buffer += std::to_string(plain.result);
-        buffer += "\ne\n";
-    };
-
     while(reader.hasNext())
     {
-        emitEntry(reader.next());
+        emitPlainEntry(buffer, reader.next());
 
         ++numProcessedPositions;
 
@@ -1379,16 +1386,9 @@ void decompressBin(std::string inputPath, std::string outputPath, std::ios_base:
     std::vector<char> buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto emitEntry = [&](const TrainingDataEntry& plain)
-    {
-        auto psv = trainingDataEntryToPackedSfenValue(plain);
-        const char* data = reinterpret_cast<const char*>(&psv);
-        buffer.insert(buffer.end(), data, data+sizeof(psv));
-    };
-
     while(reader.hasNext())
     {
-        emitEntry(reader.next());
+        emitBinEntry(buffer, reader.next());
 
         ++numProcessedPositions;
 
@@ -1432,29 +1432,6 @@ void convertBinToPlain(std::string inputPath, std::string outputPath, std::ios_b
     std::string buffer;
     buffer.reserve(bufferSize * 2);
 
-    auto emitEntry = [&](const TrainingDataEntry& plain)
-    {
-        buffer += "fen ";
-        buffer += plain.pos.fen();
-        buffer += '\n';
-
-        buffer += "move ";
-        buffer += uci::moveToUci(plain.pos, plain.move);
-        buffer += '\n';
-
-        buffer += "score ";
-        buffer += std::to_string(plain.score);
-        buffer += '\n';
-
-        buffer += "ply ";
-        buffer += std::to_string(plain.ply);
-        buffer += '\n';
-
-        buffer += "result ";
-        buffer += std::to_string(plain.result);
-        buffer += "\ne\n";
-    };
-
     nodchip::PackedSfenValue psv;
     for(;;)
     {
@@ -1464,7 +1441,7 @@ void convertBinToPlain(std::string inputPath, std::string outputPath, std::ios_b
             break;
         }
 
-        emitEntry(packedSfenValueToTrainingDataEntry(psv));
+        emitPlainEntry(buffer, packedSfenValueToTrainingDataEntry(psv));
 
         ++numProcessedPositions;
 
@@ -1508,13 +1485,6 @@ void convertPlainToBin(std::string inputPath, std::string outputPath, std::ios_b
     const auto base = inputFile.tellg();
     std::size_t numProcessedPositions = 0;
 
-    auto emitEntry = [&](const TrainingDataEntry& plain)
-    {
-        auto psv = trainingDataEntryToPackedSfenValue(plain);
-        const char* data = reinterpret_cast<const char*>(&psv);
-        buffer.insert(buffer.end(), data, data+sizeof(psv));
-    };
-
     for(;;)
     {
         inputFile >> key;
@@ -1527,7 +1497,7 @@ void convertPlainToBin(std::string inputPath, std::string outputPath, std::ios_b
         {
             e.move = uci::uciToMove(e.pos, move);
 
-            emitEntry(e);
+            emitBinEntry(buffer, e);
 
             ++numProcessedPositions;
 
